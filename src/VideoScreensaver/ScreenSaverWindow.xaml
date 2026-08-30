@@ -1,0 +1,17 @@
+<Window
+    x:Class="VideoScreensaver.ScreenSaverWindow"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
+    <Grid x:Name="Root" Background="Black" PointerMoved="Root_PointerMoved" KeyDown="Root_KeyDown">
+        <MediaPlayerElement x:Name="PlayerA" AreTransportControlsEnabled="False"
+                            AutoPlay="False" Stretch="UniformToFill" Opacity="0" />
+        <MediaPlayerElement x:Name="PlayerB" AreTransportControlsEnabled="False"
+                            AutoPlay="False" Stretch="UniformToFill" Opacity="0" />
+        <StackPanel x:Name="EmptyState" HorizontalAlignment="Center" VerticalAlignment="Center" Spacing="12" MaxWidth="400">
+            <TextBlock Text="No hay vídeos para reproducir" HorizontalAlignment="Center"
+                       Style="{StaticResource TitleTextBlockStyle}" Foreground="White" TextAlignment="Center" />
+            <TextBlock Text="Abre la configuración y selecciona una carpeta con vídeos compatibles."
+                       Foreground="White" Opacity="0.78" TextWrapping="Wrap" TextAlignment="Center" />
+        </StackPanel>
+    </Grid>
+</Window>

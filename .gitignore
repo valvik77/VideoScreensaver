@@ -1,0 +1,15 @@
+# Build output
+[Bb]in/
+[Oo]bj/
+[Ll]og/
+
+# User-specific files
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+.vs/
+
+# Publish output
+publish/
+artifacts/

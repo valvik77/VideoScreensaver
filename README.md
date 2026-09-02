@@ -53,8 +53,9 @@ Genera el instalador autocontenido con Inno Setup 7:
 
 El instalador se genera en `artifacts\installer\VideoScreensaver-Setup-<versión>.exe`.
 
-Al ejecutar la instalación:
-- Instala `VideoScreensaver.exe` y `VideoScreensaver.scr` en la carpeta de programas del usuario actual (`%LOCALAPPDATA%\Programs\Video Screensaver`), sin requerir privilegios de administrador.
+Al ejecutar la instalación (requiere privilegios de administrador):
+- Instala la aplicación completa en `Archivos de programa\Video Screensaver`.
+- Instala un pequeño lanzador como `%WINDIR%\System32\VideoScreensaver.scr`. Windows solo detecta los `.scr` ubicados directamente en `System32`, así que esto es lo que hace que "Video Screensaver" aparezca en el desplegable del diálogo clásico "Cambiar protector de pantalla"; el lanzador simplemente reenvía la ejecución a la aplicación real.
 - Registra el protector en `HKCU\Control Panel\Desktop\SCRNSAVE.EXE`.
 - Abre directamente la aplicación para que puedas explorar la galería, seleccionar vídeos y probar el salvapantallas.
 

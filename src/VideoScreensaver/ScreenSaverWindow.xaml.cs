@@ -443,23 +443,17 @@ public sealed partial class ScreenSaverWindow : Window
                 {
                     if (!ReferenceEquals(_preloadedPlayer, player)) return;
 
-                    // MediaOpened is sufficient for preloading. The former play/pause/seek-to-zero
-                    // priming cycle raced with MediaPlayer's asynchronous seek and could leave the
-                    // incoming surface displaying a static frame at the start of the crossfade.
-                    // StartTransitionToPreloaded now waits for real forward progress instead.
-                    _preloadedReady = true;
-
-                    if (_activePlayer is null)
-                    {
-                        StartTransitionToPreloaded();
-                        return;
-                    }
-
-                    if (!_isTransitioning
-                        && (_transitionRequested || ShouldBeginTransition(_activePlayer.PlaybackSession)))
-                    {
-                        StartTransitionToPreloaded();
-                    }
+                    // Prime the decoder well ahead of the actual transition (there's no time
+                    // pressure yet) instead of only starting it right when the crossfade begins.
+                    // Starting a second video decoder exactly at transition time made the
+                    // outgoing video's decoder briefly starve/stall - visible as a freeze on its
+                    // current frame right as the fade started, worse the longer FadeDuration was.
+                    // Unlike the old priming cycle, we deliberately do NOT seek back to position
+                    // zero after pausing: that seek was asynchronous and could still be settling
+                    // when the crossfade started, leaving a static first frame visible during the
+                    // fade. Pausing at whatever small position it reached avoids that race; losing
+                    // a fraction of a second of the very start of the clip is not noticeable.
+                    PrimeIncomingPlayer(player);
                 });
             };
             mediaFailed = (player, _) =>
@@ -492,6 +486,62 @@ public sealed partial class ScreenSaverWindow : Window
             // Skip broken item (e.g. download failed)
             DispatcherQueue.TryEnqueue(() => BeginPreload(advanceIndex: true));
         }
+    }
+
+    /// <summary>
+    /// Plays the incoming (hidden, opacity 0) player briefly so its decoder is warmed up and
+    /// producing frames, then pauses it in place - without seeking back to zero, since that seek
+    /// is asynchronous and could still be settling once the crossfade actually starts. This runs
+    /// well ahead of the transition, so it doesn't compete with the outgoing video's decoder for
+    /// resources right when the fade begins (which is what caused the outgoing video to freeze
+    /// for a moment at the start of the crossfade).
+    /// </summary>
+    private void PrimeIncomingPlayer(MediaPlayer player)
+    {
+        var primingCompleted = false;
+        var primingTimeoutTimer = DispatcherQueue.CreateTimer();
+        primingTimeoutTimer.Interval = TimeSpan.FromMilliseconds(800);
+        TypedEventHandler<MediaPlaybackSession, object>? primed = null;
+
+        void CompletePriming()
+        {
+            if (primingCompleted) return;
+            primingCompleted = true;
+            primingTimeoutTimer.Stop();
+            player.PlaybackSession.PositionChanged -= primed;
+
+            if (!ReferenceEquals(_preloadedPlayer, player)) return;
+            player.Pause();
+            _preloadedReady = true;
+
+            if (_activePlayer is null)
+            {
+                StartTransitionToPreloaded();
+                return;
+            }
+
+            if (!_isTransitioning
+                && (_transitionRequested || ShouldBeginTransition(_activePlayer.PlaybackSession)))
+            {
+                StartTransitionToPreloaded();
+            }
+        }
+
+        primed = (session, _) =>
+        {
+            // A couple of frames of real forward progress is enough to confirm the decoder has
+            // actually started producing output, without keeping it running (and burning
+            // resources) for longer than needed this far ahead of the transition.
+            if (session.Position < TimeSpan.FromMilliseconds(120)) return;
+            DispatcherQueue.TryEnqueue(CompletePriming);
+        };
+        // Some clips (particular codec/container quirks) never raise a PositionChanged event
+        // here at all - a short timeout guarantees priming always completes one way or another,
+        // instead of leaving _preloadedReady stuck at false forever.
+        primingTimeoutTimer.Tick += (_, _) => DispatcherQueue.TryEnqueue(CompletePriming);
+        player.PlaybackSession.PositionChanged += primed;
+        primingTimeoutTimer.Start();
+        player.Play();
     }
 
     private void StartTransitionToPreloaded()

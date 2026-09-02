@@ -703,6 +703,15 @@ public sealed partial class ScreenSaverWindow : Window
         outgoing.Opacity = 1;
         incoming.Opacity = 0;
 
+        // PlayerA/PlayerB alternate as outgoing/incoming across successive transitions, but their
+        // declaration order in the Grid never changes - whichever was declared last always paints
+        // on top. Without forcing the incoming element above the outgoing one here, roughly half
+        // of all transitions (whenever the incoming element happens to be the one declared first)
+        // would fade in underneath the still-opaque outgoing surface, making the animation
+        // completely invisible and the video switch look like a hard cut instead of a crossfade.
+        Canvas.SetZIndex(outgoing, 0);
+        Canvas.SetZIndex(incoming, 1);
+
         // Respect the configured duration when possible, but never let the opacity animation
         // outlive the decodable portion of a short outgoing clip. Leaving a small tail margin
         // also absorbs rounding differences between NaturalDuration and the final timestamp.

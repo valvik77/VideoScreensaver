@@ -19,4 +19,7 @@
     <PackageReference Include="Microsoft.WindowsAppSDK" Version="1.8.250916003" />
     <PackageReference Include="System.Security.Cryptography.ProtectedData" Version="10.0.11" />
   </ItemGroup>
+  <ItemGroup>
+    <InternalsVisibleTo Include="VideoScreensaver.Tests" />
+  </ItemGroup>
 </Project>

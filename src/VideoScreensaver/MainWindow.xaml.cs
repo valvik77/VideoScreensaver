@@ -4,6 +4,7 @@ using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
 using Microsoft.UI.Xaml.Controls.Primitives;
 using Microsoft.UI.Xaml.Input;
+using Microsoft.UI.Xaml.Media;
 using Microsoft.UI.Xaml.Media.Imaging;
 using Windows.Graphics;
 using Windows.Media.Core;
@@ -51,11 +52,19 @@ public sealed partial class MainWindow : Window
         _ = Task.Run(() => VideoCacheService.PurgeOldEntries(TimeSpan.FromDays(7)));
         _ = Task.Run(() => VideoCacheService.PurgeIncompleteDownloads(TimeSpan.FromDays(1)));
 
-        AppWindow.Closing += (_, _) => _videoPreviewWindow?.PrepareForOwnerClose();
+        AppWindow.Closing += (_, _) =>
+        {
+            _videoPreviewWindow?.PrepareForOwnerClose();
+            _testWindow?.RequestClose();
+            DisposeMediaPlayers(Root);
+        };
         Closed += (_, _) =>
         {
             _videoPreviewWindow?.Shutdown();
             _videoPreviewWindow = null;
+            _testWindow?.RequestClose();
+            _testWindow = null;
+            Application.Current.Exit();
         };
     }
 
@@ -436,6 +445,7 @@ public sealed partial class MainWindow : Window
             if (Uri.TryCreate(videoUriString, UriKind.Absolute, out var uri))
             {
                 hoverPlayer.Source = MediaSource.CreateFromUri(uri);
+                hoverPlayer.MediaPlayer.CommandManager.IsEnabled = false;
                 hoverPlayer.MediaPlayer.IsMuted = true;
                 hoverPlayer.MediaPlayer.IsLoopingEnabled = true;
                 hoverPlayer.MediaPlayer.Play();
@@ -504,6 +514,41 @@ public sealed partial class MainWindow : Window
         else
         {
             _videoPreviewWindow.ShowVideo(videoUri);
+        }
+    }
+
+    private static void DisposeMediaPlayers(DependencyObject root)
+    {
+        // Every XAML MediaPlayerElement owns a native SMTC window. Merely clearing Source does
+        // not release it, so recycled/hover thumbnail players can keep the process alive after
+        // the main WinUI window has closed.
+        if (root is MediaPlayerElement mediaElement)
+        {
+            try
+            {
+                mediaElement.Source = null;
+                mediaElement.MediaPlayer.CommandManager.IsEnabled = false;
+                mediaElement.MediaPlayer.Dispose();
+            }
+            catch
+            {
+                // Another teardown path may already have disposed this realized template item.
+            }
+        }
+
+        int childCount;
+        try
+        {
+            childCount = VisualTreeHelper.GetChildrenCount(root);
+        }
+        catch
+        {
+            return;
+        }
+
+        for (var index = 0; index < childCount; index++)
+        {
+            DisposeMediaPlayers(VisualTreeHelper.GetChild(root, index));
         }
     }
 
@@ -616,16 +661,24 @@ public sealed partial class MainWindow : Window
     private void TestButton_Click(object sender, RoutedEventArgs e)
     {
         AutoSaveSettings();
-        _testWindow?.Close();
-        _testWindow = new ScreenSaverWindow(closeOnPointerMovement: false, onClosed: () =>
+        _testWindow?.RequestClose();
+
+        ScreenSaverWindow? testWindow = null;
+        testWindow = new ScreenSaverWindow(closeOnPointerMovement: true, onClosed: () =>
         {
             DispatcherQueue.TryEnqueue(() =>
             {
-                _testWindow = null;
+                // A deferred callback from an older test must never clear the reference to the
+                // newer window; losing it was what allowed fullscreen video windows to accumulate.
+                if (ReferenceEquals(_testWindow, testWindow))
+                {
+                    _testWindow = null;
+                }
                 Activate();
             });
         });
-        _testWindow.Activate();
+        _testWindow = testWindow;
+        testWindow.Activate();
     }
 
     #endregion

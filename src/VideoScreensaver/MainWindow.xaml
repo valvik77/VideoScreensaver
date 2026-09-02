@@ -221,7 +221,7 @@
                                         <TextBlock Text="{x:Bind Tags}" FontSize="11" Foreground="White" />
                                     </Border>
                                     <Border Background="{ThemeResource AccentFillColorDefaultBrush}" HorizontalAlignment="Right" VerticalAlignment="Top"
-                                            Padding="7,4" Margin="6" CornerRadius="4" Visibility="{x:Bind VisibleIf(IsInPlaylist)}">
+                                            Padding="7,4" Margin="6" CornerRadius="4" Visibility="{x:Bind VisibleIf(IsInPlaylist), Mode=OneWay}">
                                         <StackPanel Orientation="Horizontal" Spacing="5">
                                             <FontIcon Glyph="&#xE73E;" FontSize="12" Foreground="White" />
                                             <TextBlock Text="En la lista" FontSize="11" FontWeight="SemiBold" Foreground="White" />

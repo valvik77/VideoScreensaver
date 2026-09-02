@@ -2,6 +2,7 @@ using Microsoft.UI.Composition;
 using Microsoft.UI.Dispatching;
 using Microsoft.UI.Windowing;
 using Microsoft.UI.Xaml;
+using Microsoft.UI.Xaml.Controls;
 using Microsoft.UI.Xaml.Hosting;
 using Microsoft.UI.Xaml.Input;
 using System.Numerics;
@@ -16,14 +17,6 @@ namespace VideoScreensaver;
 public sealed partial class ScreenSaverWindow : Window
 {
     private readonly TimeSpan FadeDuration;
-    // Media containers do not always report an end timestamp that exactly matches the last
-    // decodable frame. Starting slightly early keeps the outgoing player away from MediaEnded
-    // until its opacity has already reached zero.
-    // The crossfade must finish while the outgoing video is still moving. This reserve keeps its
-    // final (occasionally non-decodable or repeated) timestamps completely outside the visible
-    // transition instead of using a frozen last frame as part of the fade.
-    private static readonly TimeSpan TransitionLead = TimeSpan.FromSeconds(2);
-
     private readonly AppSettings _settings = SettingsService.Load();
     private readonly MediaPlayer _mediaPlayerA;
     private readonly MediaPlayer _mediaPlayerB;
@@ -49,6 +42,8 @@ public sealed partial class ScreenSaverWindow : Window
     private bool _transitionRequested;
 
     private bool _isTransitioning;
+    private bool _isClosing;
+    private Action? _completeActiveTransition;
 
     // If a video is shorter than the crossfade duration, its MediaEnded (or a late
     // PositionChanged) can fire while the PREVIOUS crossfade is still running. PlayNext() bails
@@ -66,6 +61,8 @@ public sealed partial class ScreenSaverWindow : Window
     // A dedicated high-frequency timer checks the position directly instead, closing that gap.
     private readonly DispatcherQueueTimer _watchdogTimer;
     private Windows.Foundation.Point? _pointerOrigin;
+    private NativePoint? _nativePointerOrigin;
+    private DateTimeOffset _pointerExitArmedAt;
     private bool _cursorHidden;
 
     public ScreenSaverWindow(nint previewParent = 0, bool closeOnPointerMovement = true, Action? onClosed = null)
@@ -91,6 +88,8 @@ public sealed partial class ScreenSaverWindow : Window
 
         _mediaPlayerA = PlayerA.MediaPlayer;
         _mediaPlayerB = PlayerB.MediaPlayer;
+        _mediaPlayerA.CommandManager.IsEnabled = false;
+        _mediaPlayerB.CommandManager.IsEnabled = false;
         _mediaPlayerA.IsMuted = _settings.Mute;
         _mediaPlayerB.IsMuted = _settings.Mute;
 
@@ -105,6 +104,7 @@ public sealed partial class ScreenSaverWindow : Window
 
         Closed += (_, _) =>
         {
+            _isClosing = true;
             _watchdogTimer.Stop();
             RestoreCursor();
             _mediaPlayerA.Dispose();
@@ -123,6 +123,7 @@ public sealed partial class ScreenSaverWindow : Window
                 Root.Focus(FocusState.Programmatic);
                 Activate();
                 SetForegroundWindow(WindowNative.GetWindowHandle(this));
+                ArmPointerExit();
             }
         };
 
@@ -186,6 +187,13 @@ public sealed partial class ScreenSaverWindow : Window
             return 0;
         }
 
+        // MediaPlayerElement can consume WinUI pointer events. Observe the native message too so
+        // the test window and the real screensaver always leave when the user moves the mouse.
+        if (msg == WmMouseMove && _closeOnPointerMovement)
+        {
+            HandleNativePointerMovement();
+        }
+
         if (msg == WmSetCursor && _cursorHidden)
         {
             SetCursor(nint.Zero);
@@ -206,11 +214,18 @@ public sealed partial class ScreenSaverWindow : Window
         _cursorHidden = false;
     }
 
+    public void RequestClose() => ExitScreenSaver();
+
     private void ExitScreenSaver()
     {
-        if (_previewParent != 0) return;
+        if (_previewParent != 0 || _isClosing) return;
+
+        // ESC can be observed both by the native window procedure and by WinUI input. The first
+        // exit signal wins. AppWindow.Destroy avoids Window.Close's E_ABORT race, which could
+        // leave a still-playing fullscreen HWND orphaned after the configuration window returned.
+        _isClosing = true;
         RestoreCursor();
-        Close();
+        AppWindow.Destroy();
     }
 
     private const int GwlStyle = -16;
@@ -222,6 +237,7 @@ public sealed partial class ScreenSaverWindow : Window
     private const uint SwpFrameChanged = 0x0020;
     private const uint SwpShowWindow = 0x0040;
     private const uint WmSetCursor = 0x0020;
+    private const uint WmMouseMove = 0x0200;
     private const uint WmKeyDown = 0x0100;
     private const uint WmSysKeyDown = 0x0104;
     private static readonly nint VkEscape = new(0x1B);
@@ -255,6 +271,10 @@ public sealed partial class ScreenSaverWindow : Window
     [return: MarshalAs(UnmanagedType.Bool)]
     private static extern bool SetWindowPos(nint window, nint insertAfter, int x, int y, int width, int height, uint flags);
 
+    [DllImport("user32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool GetCursorPos(out NativePoint point);
+
     [StructLayout(LayoutKind.Sequential)]
     private struct Rect
     {
@@ -262,6 +282,13 @@ public sealed partial class ScreenSaverWindow : Window
         public int Top;
         public int Right;
         public int Bottom;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct NativePoint
+    {
+        public int X;
+        public int Y;
     }
 
     private void PlayNext()
@@ -305,10 +332,16 @@ public sealed partial class ScreenSaverWindow : Window
 
     private void HandleMediaEnded(MediaPlayer player)
     {
-        // Once a crossfade starts, _activePlayer is the incoming player. MediaEnded from the
-        // outgoing player is therefore expected and must not queue yet another transition.
+        // Once a crossfade starts, _activePlayer is the incoming player. If the outgoing decoder
+        // reaches its real end earlier than the container's reported NaturalDuration, its last
+        // frame would otherwise remain static underneath the remainder of the opacity animation.
+        // Complete the transition instead of displaying that frozen frame.
         if (!ReferenceEquals(player, _activePlayer))
         {
+            if (_isTransitioning)
+            {
+                _completeActiveTransition?.Invoke();
+            }
             return;
         }
 
@@ -358,7 +391,7 @@ public sealed partial class ScreenSaverWindow : Window
         var preloadIndex = _index;
         var videoTarget = _videos[preloadIndex];
 
-        var preloadElement = _usingPlayerA ? PlayerA : PlayerB;
+        MediaPlayerElement preloadElement = _usingPlayerA ? PlayerA : PlayerB;
         var preloadPlayer = _usingPlayerA ? _mediaPlayerA : _mediaPlayerB;
         _usingPlayerA = !_usingPlayerA;
 
@@ -370,17 +403,20 @@ public sealed partial class ScreenSaverWindow : Window
         _preloadedIndex = preloadIndex;
         _preloadedReady = false;
 
-        _ = OpenPreloadSourceAsync(preloadPlayer, videoTarget);
+        _ = OpenPreloadSourceAsync(preloadElement, preloadPlayer, videoTarget);
     }
 
     /// <summary>
-    /// Resolves the actual media source for <paramref name="videoTarget"/> and assigns it to
-    /// <paramref name="preloadPlayer"/>. Remote (Pixabay) videos are downloaded to a local cache
+    /// Resolves the actual media source for <paramref name="videoTarget"/> and assigns it through
+    /// <paramref name="preloadElement"/>. Remote (Pixabay) videos are downloaded to a local cache
     /// first instead of being played directly via HTTP streaming - direct streaming was found to
     /// stall/rebuffer near the end of the clip, freezing the screensaver on the last frame during
     /// a crossfade, something that never happened with local files (see VideoCacheService).
     /// </summary>
-    private async Task OpenPreloadSourceAsync(MediaPlayer preloadPlayer, string videoTarget)
+    private async Task OpenPreloadSourceAsync(
+        MediaPlayerElement preloadElement,
+        MediaPlayer preloadPlayer,
+        string videoTarget)
     {
         try
         {
@@ -407,65 +443,23 @@ public sealed partial class ScreenSaverWindow : Window
                 {
                     if (!ReferenceEquals(_preloadedPlayer, player)) return;
 
-                    // Prime the player by playing a fraction of a second and pausing again right
-                    // after its first frame renders, while there's no time pressure (we're still
-                    // well ahead of the actual transition). This used to happen only right before
-                    // the crossfade animation started (see StartTransitionToPreloaded), which ate
-                    // into the timing margin the transition was scheduled with - if that margin
-                    // ran out (network hiccup, disk latency, background load, ...) the outgoing
-                    // video could reach its natural end and freeze on the last frame before the
-                    // fade even began. Priming here means the incoming player already has a
-                    // rendered frame ready and paused, so the transition can start instantly with
-                    // no further waiting.
-                    //
-                    // Some clips (particular codec/container quirks) never raise a PositionChanged
-                    // event here at all - the previous code would then wait on "primed" forever,
-                    // which left _preloadedReady stuck at false. That, in turn, made PlayNext()
-                    // slow the OUTGOING video down indefinitely (see the PlaybackRate = 0.2
-                    // branch) since it kept thinking the preload was still "in flight", and once
-                    // that video reached MediaEnded anyway it had nothing left to play and froze.
-                    // A short timeout guarantees priming always completes one way or another.
-                    var primingCompleted = false;
-                    var primingTimeoutTimer = DispatcherQueue.CreateTimer();
-                    primingTimeoutTimer.Interval = TimeSpan.FromMilliseconds(800);
-                    TypedEventHandler<MediaPlaybackSession, object>? primed = null;
-                    void CompletePriming()
+                    // MediaOpened is sufficient for preloading. The former play/pause/seek-to-zero
+                    // priming cycle raced with MediaPlayer's asynchronous seek and could leave the
+                    // incoming surface displaying a static frame at the start of the crossfade.
+                    // StartTransitionToPreloaded now waits for real forward progress instead.
+                    _preloadedReady = true;
+
+                    if (_activePlayer is null)
                     {
-                        if (primingCompleted) return;
-                        primingCompleted = true;
-                        primingTimeoutTimer.Stop();
-                        player.PlaybackSession.PositionChanged -= primed;
-
-                        if (!ReferenceEquals(_preloadedPlayer, player)) return;
-                        player.Pause();
-                        player.PlaybackSession.Position = TimeSpan.Zero;
-                        _preloadedReady = true;
-
-                        // No video playing yet (very first video of the session): start it
-                        // as soon as it's ready, there's nothing to crossfade from.
-                        if (_activePlayer is null)
-                        {
-                            StartTransitionToPreloaded();
-                            return;
-                        }
-
-                        // If PlayNext already ran and is just waiting on us, kick off the
-                        // transition now that the preload has actually finished priming.
-                        if (!_isTransitioning
-                            && (_transitionRequested || ShouldBeginTransition(_activePlayer.PlaybackSession)))
-                        {
-                            StartTransitionToPreloaded();
-                        }
+                        StartTransitionToPreloaded();
+                        return;
                     }
-                    primed = (session, _) =>
+
+                    if (!_isTransitioning
+                        && (_transitionRequested || ShouldBeginTransition(_activePlayer.PlaybackSession)))
                     {
-                        if (session.Position <= TimeSpan.Zero) return;
-                        DispatcherQueue.TryEnqueue(CompletePriming);
-                    };
-                    primingTimeoutTimer.Tick += (_, _) => DispatcherQueue.TryEnqueue(CompletePriming);
-                    player.PlaybackSession.PositionChanged += primed;
-                    primingTimeoutTimer.Start();
-                    player.Play();
+                        StartTransitionToPreloaded();
+                    }
                 });
             };
             mediaFailed = (player, _) =>
@@ -484,7 +478,10 @@ public sealed partial class ScreenSaverWindow : Window
             };
             preloadPlayer.MediaOpened += mediaOpened;
             preloadPlayer.MediaFailed += mediaFailed;
-            preloadPlayer.Source = MediaSource.CreateFromUri(uri);
+            // Keep source ownership in MediaPlayerElement. Mixing element-owned rendering with
+            // direct MediaPlayer.Source assignments is explicitly unsupported by WinUI and can
+            // make the element retain a stale video surface across a source switch.
+            preloadElement.Source = MediaSource.CreateFromUri(uri);
         }
         catch
         {
@@ -514,52 +511,101 @@ public sealed partial class ScreenSaverWindow : Window
         var outgoingElement = _activeElement;
 
         _isTransitioning = !isInitialVideo;
-        incomingPlayer.Play();
 
         if (isInitialVideo || outgoingPlayer is null || outgoingElement is null)
         {
             _activePlayer = incomingPlayer;
             _activeElement = incomingElement;
             incomingElement.Opacity = 1;
+            incomingPlayer.Play();
             // Immediately start preloading the video after this one so it's ready well in
             // advance of the next transition too.
             BeginPreload(advanceIndex: true);
         }
         else
         {
-            // Wait for the incoming player to actually render its first frame after Play()
-            // before starting the opacity crossfade - otherwise the animation runs over a still
-            // black/blank frame, which looks like a fade-to-black instead of a true crossfade.
-            // Guarded with a timeout too: if priming earlier already fell back on ITS timeout
-            // (i.e. this clip never actually raises PositionChanged), waiting here again would
-            // hang forever and the crossfade would never start, leaving the video stuck.
-            var startCompleted = false;
-            var startTimeoutTimer = DispatcherQueue.CreateTimer();
-            startTimeoutTimer.Interval = TimeSpan.FromMilliseconds(500);
-            TypedEventHandler<MediaPlaybackSession, object>? positionChanged = null;
-            void CompleteStart()
-            {
-                if (startCompleted) return;
-                startCompleted = true;
-                startTimeoutTimer.Stop();
-                incomingPlayer.PlaybackSession.PositionChanged -= positionChanged;
-
-                _activePlayer = incomingPlayer;
-                _activeElement = incomingElement;
-                // Only kick off the next preload once the crossfade actually finishes and
-                // the outgoing player has released its Source (see CrossFade's onCompleted).
-                CrossFade(outgoingElement, outgoingPlayer, incomingElement,
-                    onCompleted: () => BeginPreload(advanceIndex: true));
-            }
-            positionChanged = (session, _) =>
-            {
-                if (session.Position <= TimeSpan.Zero) return;
-                DispatcherQueue.TryEnqueue(CompleteStart);
-            };
-            startTimeoutTimer.Tick += (_, _) => DispatcherQueue.TryEnqueue(CompleteStart);
-            incomingPlayer.PlaybackSession.PositionChanged += positionChanged;
-            startTimeoutTimer.Start();
+            StartCrossFadeWhenIncomingAdvances(
+                outgoingElement,
+                outgoingPlayer,
+                incomingElement,
+                incomingPlayer);
         }
+    }
+
+    private void StartCrossFadeWhenIncomingAdvances(
+        FrameworkElement outgoingElement,
+        MediaPlayer outgoingPlayer,
+        FrameworkElement incomingElement,
+        MediaPlayer incomingPlayer)
+    {
+        var startCompleted = false;
+        var fallbackTimer = DispatcherQueue.CreateTimer();
+        fallbackTimer.Interval = TimeSpan.FromSeconds(2);
+        TypedEventHandler<MediaPlaybackSession, object>? positionChanged = null;
+        TypedEventHandler<MediaPlayer, MediaPlayerFailedEventArgs>? mediaFailed = null;
+
+        void StopWaiting()
+        {
+            fallbackTimer.Stop();
+            incomingPlayer.PlaybackSession.PositionChanged -= positionChanged;
+            incomingPlayer.MediaFailed -= mediaFailed;
+        }
+
+        void CompleteStart()
+        {
+            if (startCompleted) return;
+            startCompleted = true;
+            StopWaiting();
+
+            if (_isClosing) return;
+            _activePlayer = incomingPlayer;
+            _activeElement = incomingElement;
+            CrossFade(outgoingElement, outgoingPlayer, incomingElement,
+                onCompleted: () => BeginPreload(advanceIndex: true));
+        }
+
+        void AbortStart()
+        {
+            if (startCompleted) return;
+            startCompleted = true;
+            StopWaiting();
+
+            if (_isClosing) return;
+            incomingPlayer.Pause();
+            SetMediaSource(incomingElement, null);
+            incomingElement.Opacity = 0;
+            _isTransitioning = false;
+
+            // Reuse the same hidden player for the next candidate. The outgoing video remains
+            // active and moving while the unusable incoming clip is skipped.
+            _usingPlayerA = ReferenceEquals(incomingPlayer, _mediaPlayerA);
+            BeginPreload(advanceIndex: true);
+        }
+
+        positionChanged = (session, _) =>
+        {
+            // Requiring several frames of forward progress avoids fading into the cached first
+            // frame while the decoder is still resuming. The outgoing player keeps moving and
+            // remains fully visible during this preparation interval.
+            if (session.Position < TimeSpan.FromMilliseconds(120)) return;
+            DispatcherQueue.TryEnqueue(CompleteStart);
+        };
+        mediaFailed = (_, _) => DispatcherQueue.TryEnqueue(AbortStart);
+        fallbackTimer.Tick += (_, _) =>
+        {
+            if (incomingPlayer.PlaybackSession.Position >= TimeSpan.FromMilliseconds(120))
+            {
+                CompleteStart();
+            }
+            else
+            {
+                AbortStart();
+            }
+        };
+        incomingPlayer.PlaybackSession.PositionChanged += positionChanged;
+        incomingPlayer.MediaFailed += mediaFailed;
+        fallbackTimer.Start();
+        incomingPlayer.Play();
     }
 
     private void CheckTransitionWatchdog()
@@ -589,11 +635,7 @@ public sealed partial class ScreenSaverWindow : Window
             return false;
         }
 
-        var requiredRemainingTime = FadeDuration + TransitionLead;
-        var transitionStart = naturalDuration > requiredRemainingTime
-            ? naturalDuration - requiredRemainingTime
-            : TimeSpan.FromMilliseconds(50);
-
+        var transitionStart = TransitionTiming.GetTransitionStart(naturalDuration, FadeDuration);
         return session.Position >= transitionStart;
     }
 
@@ -619,11 +661,6 @@ public sealed partial class ScreenSaverWindow : Window
             new Vector2(0.42f, 0f),
             new Vector2(0.58f, 1f));
 
-        var fadeOut = compositor.CreateScalarKeyFrameAnimation();
-        fadeOut.InsertKeyFrame(0f, 1f);
-        fadeOut.InsertKeyFrame(1f, 0f, smoothEasing);
-        fadeOut.Duration = fadeDuration;
-
         var fadeIn = compositor.CreateScalarKeyFrameAnimation();
         fadeIn.InsertKeyFrame(0f, 0f);
         fadeIn.InsertKeyFrame(1f, 1f, smoothEasing);
@@ -634,35 +671,45 @@ public sealed partial class ScreenSaverWindow : Window
         // (which previously made the fade invisible because the plain property assignment ran
         // synchronously right after starting the animation).
         var batch = compositor.CreateScopedBatch(CompositionBatchTypes.Animation);
+        var transitionCompleted = false;
+        void CompleteTransition()
+        {
+            if (transitionCompleted) return;
+            transitionCompleted = true;
+            _completeActiveTransition = null;
+
+            outgoingVisual.StopAnimation("Opacity");
+            incomingVisual.StopAnimation("Opacity");
+            outgoing.Opacity = 0;
+            incoming.Opacity = 1;
+            outgoingPlayer.Pause();
+            SetMediaSource(outgoing, null);
+            _isTransitioning = false;
+            // Only preload the video after this one once the outgoing player has actually
+            // released its Source - preloading earlier could reuse (and reassign the Source
+            // of) the player that was still mid-fade, cutting the outgoing video off abruptly
+            // and looking like a fade-to-black instead of a true crossfade.
+            onCompleted?.Invoke();
+
+            // Replay a PlayNext() request that arrived while this crossfade was still
+            // running (e.g. a clip shorter than FadeDuration reached its end mid-fade).
+            if (_pendingPlayNext)
+            {
+                _pendingPlayNext = false;
+                PlayNext();
+            }
+        }
+
+        _completeActiveTransition = () => DispatcherQueue.TryEnqueue(CompleteTransition);
         batch.Completed += (_, _) =>
         {
-            DispatcherQueue.TryEnqueue(() =>
-            {
-                outgoingVisual.StopAnimation("Opacity");
-                incomingVisual.StopAnimation("Opacity");
-                outgoing.Opacity = 0;
-                incoming.Opacity = 1;
-                outgoingPlayer.Pause();
-                outgoingPlayer.Source = null;
-                _isTransitioning = false;
-                // Only preload the video after this one once the outgoing player has actually
-                // released its Source - preloading earlier could reuse (and reassign the Source
-                // of) the player that was still mid-fade, cutting the outgoing video off abruptly
-                // and looking like a fade-to-black instead of a true crossfade.
-                onCompleted?.Invoke();
-
-                // Replay a PlayNext() request that arrived while this crossfade was still
-                // running (e.g. a clip shorter than FadeDuration reached its end mid-fade) -
-                // otherwise the newly-active video would stay frozen on its last frame forever.
-                if (_pendingPlayNext)
-                {
-                    _pendingPlayNext = false;
-                    PlayNext();
-                }
-            });
+            DispatcherQueue.TryEnqueue(CompleteTransition);
         };
 
-        outgoingVisual.StartAnimation("Opacity", fadeOut);
+        // An opaque incoming video fading from 0 to 1 already replaces the outgoing pixels with
+        // the mathematically correct crossfade weights. Keep the outgoing surface at opacity 1
+        // underneath so WinUI continues presenting its frames normally; animating both video
+        // surfaces could make the outgoing one briefly retain its last presented frame.
         incomingVisual.StartAnimation("Opacity", fadeIn);
 
         batch.End();
@@ -670,26 +717,67 @@ public sealed partial class ScreenSaverWindow : Window
 
     private TimeSpan GetEffectiveFadeDuration(MediaPlaybackSession outgoingSession)
     {
-        var remaining = outgoingSession.NaturalDuration - outgoingSession.Position;
-        if (remaining <= TimeSpan.Zero)
-        {
-            return TimeSpan.FromMilliseconds(150);
-        }
+        return TransitionTiming.GetEffectiveFadeDuration(
+            outgoingSession.NaturalDuration,
+            outgoingSession.Position,
+            FadeDuration);
+    }
 
-        var availableBeforeLastFrame = remaining - TimeSpan.FromMilliseconds(250);
-        if (availableBeforeLastFrame < TimeSpan.FromMilliseconds(150))
+    private static void SetMediaSource(FrameworkElement element, MediaSource? source)
+    {
+        if (element is MediaPlayerElement mediaElement)
         {
-            availableBeforeLastFrame = TimeSpan.FromMilliseconds(150);
+            mediaElement.Source = source;
         }
-
-        return availableBeforeLastFrame < FadeDuration
-            ? availableBeforeLastFrame
-            : FadeDuration;
     }
 
     private void Root_KeyDown(object sender, KeyRoutedEventArgs e)
     {
         ExitScreenSaver();
+    }
+
+    private void ArmPointerExit()
+    {
+        if (_previewParent != 0 || !_closeOnPointerMovement)
+        {
+            return;
+        }
+
+        // The click used to launch the test window often produces a trailing WM_MOUSEMOVE.
+        // Keep the saver open briefly, then require actual movement from that initial position.
+        _pointerExitArmedAt = DateTimeOffset.UtcNow.AddMilliseconds(750);
+        _pointerOrigin = null;
+        _nativePointerOrigin = GetCursorPos(out var point) ? point : null;
+    }
+
+    private void HandleNativePointerMovement()
+    {
+        if (_previewParent != 0 || _isClosing || !_closeOnPointerMovement)
+        {
+            return;
+        }
+
+        if (!GetCursorPos(out var point))
+        {
+            return;
+        }
+
+        if (DateTimeOffset.UtcNow < _pointerExitArmedAt)
+        {
+            _nativePointerOrigin = point;
+            return;
+        }
+
+        if (_nativePointerOrigin is null)
+        {
+            _nativePointerOrigin = point;
+            return;
+        }
+
+        if (Math.Abs(point.X - _nativePointerOrigin.Value.X) > 10 || Math.Abs(point.Y - _nativePointerOrigin.Value.Y) > 10)
+        {
+            DispatcherQueue.TryEnqueue(ExitScreenSaver);
+        }
     }
 
     private void Root_PointerMoved(object sender, PointerRoutedEventArgs e)
@@ -705,6 +793,12 @@ public sealed partial class ScreenSaverWindow : Window
         HideCursor();
 
         var point = e.GetCurrentPoint(Root).Position;
+        if (DateTimeOffset.UtcNow < _pointerExitArmedAt)
+        {
+            _pointerOrigin = point;
+            return;
+        }
+
         if (_pointerOrigin is null)
         {
             _pointerOrigin = point;

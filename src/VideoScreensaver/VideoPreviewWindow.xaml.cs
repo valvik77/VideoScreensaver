@@ -35,6 +35,7 @@ public sealed partial class VideoPreviewWindow : Window
         Title = "Vista previa de vídeo - Video Screensaver";
         _videoUri = videoUri;
         _ownerHandle = ownerHandle;
+        Player.MediaPlayer.CommandManager.IsEnabled = false;
 
         Player.MediaPlayer.MediaEnded += (_, _) => DispatcherQueue.TryEnqueue(DismissPreview);
         Player.MediaPlayer.MediaOpened += (_, _) => DispatcherQueue.TryEnqueue(() =>

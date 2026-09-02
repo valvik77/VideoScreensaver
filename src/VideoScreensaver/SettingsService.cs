@@ -33,13 +33,21 @@ public static class SettingsService
                 return new AppSettings();
             }
 
+            var playlist = persisted.Playlist ?? [];
+            foreach (var item in playlist.Where(item => item.SourceType == VideoSourceType.Pixabay))
+            {
+                // Migrate existing playlists too; otherwise only newly-added gallery items would
+                // benefit and old high-load URLs would continue stalling during crossfades.
+                item.VideoUri = PixabayVideoUrl.ForSmoothPlayback(item.VideoUri);
+            }
+
             return new AppSettings
             {
                 VideoFolder = persisted.VideoFolder ?? string.Empty,
                 Shuffle = persisted.Shuffle,
                 Mute = persisted.Mute,
                 FadeSeconds = persisted.FadeSeconds,
-                Playlist = persisted.Playlist ?? [],
+                Playlist = playlist,
                 // PixabayApiKey is retained solely to migrate configurations created before
                 // DPAPI protection was introduced. It is never written again.
                 PixabayApiKey = UnprotectApiKey(persisted.PixabayApiKeyProtected) ??

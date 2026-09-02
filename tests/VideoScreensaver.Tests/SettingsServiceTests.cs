@@ -49,6 +49,51 @@ public class SettingsServiceTests
         StringAssert.Contains(migratedJson, "PixabayApiKeyProtected");
     }
 
+    [TestMethod]
+    public void Load_MigratesExistingPixabayVideoToCrossfadeVariant()
+    {
+        using var workspace = new TemporaryWorkspace();
+        var settingsPath = Path.Combine(workspace.Path, "settings.json");
+        File.WriteAllText(settingsPath,
+            """
+            {
+              "Playlist": [{
+                "SourceType": 1,
+                "VideoUri": "https://cdn.pixabay.com/video/2024/10/18/236928_large.mp4"
+              }]
+            }
+            """);
+
+        var loaded = SettingsService.Load(settingsPath);
+
+        Assert.AreEqual(
+            "https://cdn.pixabay.com/video/2024/10/18/236928_small.mp4",
+            loaded.Playlist[0].VideoUri);
+    }
+
+    [TestMethod]
+    public void Load_DoesNotRewriteLocalOrAlreadySizedVideos()
+    {
+        using var workspace = new TemporaryWorkspace();
+        var settingsPath = Path.Combine(workspace.Path, "settings.json");
+        File.WriteAllText(settingsPath,
+            """
+            {
+              "Playlist": [
+                { "SourceType": 0, "VideoUri": "C:\\Videos\\large.mp4" },
+                { "SourceType": 1, "VideoUri": "https://cdn.pixabay.com/video/clip_small.mp4" }
+              ]
+            }
+            """);
+
+        var loaded = SettingsService.Load(settingsPath);
+
+        Assert.AreEqual("C:\\Videos\\large.mp4", loaded.Playlist[0].VideoUri);
+        Assert.AreEqual(
+            "https://cdn.pixabay.com/video/clip_small.mp4",
+            loaded.Playlist[1].VideoUri);
+    }
+
     private sealed class TemporaryWorkspace : IDisposable
     {
         public string Path { get; } = System.IO.Path.Combine(

@@ -194,9 +194,11 @@ public sealed class PixabayService
         .Where(hit => IsLandscapeVideo(hit.Videos))
         .Select(hit =>
         {
-            var bestVideo = hit.Videos?.Large?.Url ??
+            // Prefer the desktop-quality variant. The player waits for actual incoming-frame
+            // progress before fading, avoiding the need to reduce all clips to the softer tiny.
+            var bestVideo = hit.Videos?.Small?.Url ??
                             hit.Videos?.Medium?.Url ??
-                            hit.Videos?.Small?.Url ??
+                            hit.Videos?.Large?.Url ??
                             hit.Videos?.Tiny?.Url ?? string.Empty;
 
             var previewVideo = hit.Videos?.Tiny?.Url ??
@@ -262,7 +264,8 @@ public sealed class PixabayService
     private static string CreateSearchCacheKey(string query, string category, int page, int perPage)
     {
         // The API key is intentionally excluded: it is secret and does not alter public results.
-        var normalized = $"landscape-v1|{query.Trim().ToLowerInvariant()}|{category.Trim().ToLowerInvariant()}|{page}|{perPage}";
+        // v4 restores desktop quality after replacing seek-based priming with frame synchronization.
+        var normalized = $"landscape-v4|{query.Trim().ToLowerInvariant()}|{category.Trim().ToLowerInvariant()}|{page}|{perPage}";
         return Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(normalized)))[..24];
     }
 

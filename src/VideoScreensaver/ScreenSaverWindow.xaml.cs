@@ -58,6 +58,15 @@ public sealed partial class ScreenSaverWindow : Window
     // sure that request is replayed as soon as the current crossfade finishes.
     private bool _pendingPlayNext;
 
+    // Some containers/codecs report a NaturalDuration that doesn't quite match the last
+    // actually-decodable frame, so the outgoing player can raise MediaEnded a bit early - while
+    // the crossfade animation is still running. Left alone, the outgoing video would just freeze
+    // on its last rendered frame for whatever time is left of the fade (more noticeable the
+    // longer FadeDuration is configured). These let HandleMediaEnded jump the in-progress
+    // crossfade straight to its finished state instead of waiting for the animation to time out.
+    private MediaPlayer? _crossFadeOutgoingPlayer;
+    private Action? _forceCompleteCrossFade;
+
     // MediaPlaybackSession.PositionChanged does not fire on every frame - it's throttled/batched
     // by the platform (observed roughly every ~200-250ms, sometimes more under load), so relying
     // on it alone to detect "we're within FadeDuration of the end" can miss the window entirely:
@@ -305,6 +314,19 @@ public sealed partial class ScreenSaverWindow : Window
 
     private void HandleMediaEnded(MediaPlayer player)
     {
+        // _activePlayer already points at the incoming player as soon as the crossfade begins
+        // (see StartTransitionToPreloaded), so MediaEnded firing on the OUTGOING player here is
+        // expected and normally ignored below. But some containers/codecs report a
+        // NaturalDuration that runs out slightly before the last actually-decodable frame, so the
+        // outgoing player can raise MediaEnded while the opacity animation is still running -
+        // left alone it would just freeze on its last frame for whatever time is left of the
+        // fade. Snap the in-progress crossfade straight to its finished state instead.
+        if (ReferenceEquals(player, _crossFadeOutgoingPlayer))
+        {
+            _forceCompleteCrossFade?.Invoke();
+            return;
+        }
+
         // Once a crossfade starts, _activePlayer is the incoming player. MediaEnded from the
         // outgoing player is therefore expected and must not queue yet another transition.
         if (!ReferenceEquals(player, _activePlayer))
@@ -629,38 +651,51 @@ public sealed partial class ScreenSaverWindow : Window
         fadeIn.InsertKeyFrame(1f, 1f, smoothEasing);
         fadeIn.Duration = fadeDuration;
 
+        var completed = false;
+        void Complete()
+        {
+            // Guard against running twice: both the batch's natural Completed event and a
+            // forced early completion (see _forceCompleteCrossFade) call into this.
+            if (completed) return;
+            completed = true;
+
+            _crossFadeOutgoingPlayer = null;
+            _forceCompleteCrossFade = null;
+
+            outgoingVisual.StopAnimation("Opacity");
+            incomingVisual.StopAnimation("Opacity");
+            outgoing.Opacity = 0;
+            incoming.Opacity = 1;
+            outgoingPlayer.Pause();
+            outgoingPlayer.Source = null;
+            _isTransitioning = false;
+            // Only preload the video after this one once the outgoing player has actually
+            // released its Source - preloading earlier could reuse (and reassign the Source
+            // of) the player that was still mid-fade, cutting the outgoing video off abruptly
+            // and looking like a fade-to-black instead of a true crossfade.
+            onCompleted?.Invoke();
+
+            // Replay a PlayNext() request that arrived while this crossfade was still
+            // running (e.g. a clip shorter than FadeDuration reached its end mid-fade) -
+            // otherwise the newly-active video would stay frozen on its last frame forever.
+            if (_pendingPlayNext)
+            {
+                _pendingPlayNext = false;
+                PlayNext();
+            }
+        }
+
+        // Tracked so HandleMediaEnded can jump straight to the finished state if the outgoing
+        // player runs out of decodable frames before the animation's scheduled duration elapses.
+        _crossFadeOutgoingPlayer = outgoingPlayer;
+        _forceCompleteCrossFade = () => DispatcherQueue.TryEnqueue(Complete);
+
         // Use a scoped batch so the final XAML Opacity values are only applied in code once the
         // composition animations actually finish, instead of being overwritten immediately
         // (which previously made the fade invisible because the plain property assignment ran
         // synchronously right after starting the animation).
         var batch = compositor.CreateScopedBatch(CompositionBatchTypes.Animation);
-        batch.Completed += (_, _) =>
-        {
-            DispatcherQueue.TryEnqueue(() =>
-            {
-                outgoingVisual.StopAnimation("Opacity");
-                incomingVisual.StopAnimation("Opacity");
-                outgoing.Opacity = 0;
-                incoming.Opacity = 1;
-                outgoingPlayer.Pause();
-                outgoingPlayer.Source = null;
-                _isTransitioning = false;
-                // Only preload the video after this one once the outgoing player has actually
-                // released its Source - preloading earlier could reuse (and reassign the Source
-                // of) the player that was still mid-fade, cutting the outgoing video off abruptly
-                // and looking like a fade-to-black instead of a true crossfade.
-                onCompleted?.Invoke();
-
-                // Replay a PlayNext() request that arrived while this crossfade was still
-                // running (e.g. a clip shorter than FadeDuration reached its end mid-fade) -
-                // otherwise the newly-active video would stay frozen on its last frame forever.
-                if (_pendingPlayNext)
-                {
-                    _pendingPlayNext = false;
-                    PlayNext();
-                }
-            });
-        };
+        batch.Completed += (_, _) => DispatcherQueue.TryEnqueue(Complete);
 
         outgoingVisual.StartAnimation("Opacity", fadeOut);
         incomingVisual.StartAnimation("Opacity", fadeIn);

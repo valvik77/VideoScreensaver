@@ -34,12 +34,17 @@ public static class VideoCacheService
     /// Returns the local path of a cached copy of <paramref name="url"/>, downloading it first if
     /// it isn't already cached.
     /// </summary>
-    public static async Task<string> GetOrDownloadAsync(string url, CancellationToken cancellationToken)
+    public static async Task<string> GetOrDownloadAsync(
+        string url,
+        CancellationToken cancellationToken,
+        string? cacheDirectory = null)
     {
-        Directory.CreateDirectory(CacheDirectory);
+        var targetDirectory = cacheDirectory ?? CacheDirectory;
+        Directory.CreateDirectory(targetDirectory);
+        PurgeIncompleteDownloads(TimeSpan.FromDays(1), targetDirectory);
 
         var extension = TryGetExtension(url);
-        var cachedFile = Path.Combine(CacheDirectory, $"{GetStableUrlHash(url)}{extension}");
+        var cachedFile = Path.Combine(targetDirectory, $"{GetStableUrlHash(url)}{extension}");
 
         if (File.Exists(cachedFile) && new FileInfo(cachedFile).Length > 0)
         {
@@ -48,18 +53,60 @@ public static class VideoCacheService
 
         // Download to a temp file first so a half-finished download (e.g. app closed mid-way)
         // never looks like a valid, complete cache entry to a later run.
-        var tempFile = $"{cachedFile}.download";
-        using (var response = await HttpClient.GetAsync(url, HttpCompletionOption.ResponseHeadersRead, cancellationToken))
+        var tempFile = Path.Combine(
+            targetDirectory,
+            $"{GetStableUrlHash(url)}.{Guid.NewGuid():N}.download");
+        try
         {
-            response.EnsureSuccessStatusCode();
-            using var responseStream = await response.Content.ReadAsStreamAsync(cancellationToken);
-            using var fileStream = File.Create(tempFile);
-            await responseStream.CopyToAsync(fileStream, cancellationToken);
-        }
+            using (var response = await HttpClient.GetAsync(url, HttpCompletionOption.ResponseHeadersRead, cancellationToken))
+            {
+                response.EnsureSuccessStatusCode();
+                using var responseStream = await response.Content.ReadAsStreamAsync(cancellationToken);
+                using var fileStream = new FileStream(tempFile, FileMode.CreateNew, FileAccess.Write, FileShare.None);
+                await responseStream.CopyToAsync(fileStream, cancellationToken);
+            }
 
-        File.Copy(tempFile, cachedFile, overwrite: true);
-        File.Delete(tempFile);
-        return cachedFile;
+            // Move within the same directory is atomic. A concurrent request can only replace
+            // this file with its own complete download, never with a partial one.
+            File.Move(tempFile, cachedFile, overwrite: true);
+            return cachedFile;
+        }
+        finally
+        {
+            if (File.Exists(tempFile))
+            {
+                File.Delete(tempFile);
+            }
+        }
+    }
+
+    public static void PurgeIncompleteDownloads(TimeSpan maxAge, string? cacheDirectory = null)
+    {
+        var targetDirectory = cacheDirectory ?? CacheDirectory;
+        if (!Directory.Exists(targetDirectory)) return;
+
+        try
+        {
+            var cutoff = DateTime.UtcNow - maxAge;
+            foreach (var partialFile in Directory.EnumerateFiles(targetDirectory, "*.download"))
+            {
+                try
+                {
+                    if (File.GetLastWriteTimeUtc(partialFile) < cutoff)
+                    {
+                        File.Delete(partialFile);
+                    }
+                }
+                catch
+                {
+                    // A download still in progress may be locked; leave it for the next cleanup.
+                }
+            }
+        }
+        catch
+        {
+            // Cache cleanup is best effort only.
+        }
     }
 
     /// <summary>

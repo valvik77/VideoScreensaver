@@ -13,14 +13,38 @@ $installerDirectory = Join-Path $artifactsDirectory "installer"
 $projectPath = Join-Path $repositoryRoot "src\VideoScreensaver\VideoScreensaver.csproj"
 $installerScript = Join-Path $PSScriptRoot "VideoScreensaver.iss"
 
-$msbuildCandidates = @(
-    "C:\Program Files\Microsoft Visual Studio\18\Community\MSBuild\Current\Bin\MSBuild.exe",
-    "C:\Program Files (x86)\Microsoft Visual Studio\18\BuildTools\MSBuild\Current\Bin\MSBuild.exe"
-)
-$msbuild = $msbuildCandidates | Where-Object { Test-Path $_ } | Select-Object -First 1
-if (-not $msbuild) {
-    throw "No se encontró MSBuild de Visual Studio. Instala Visual Studio o Build Tools con las herramientas de Windows App SDK."
+$vswhereCandidates = @(
+    "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe",
+    "$env:ProgramFiles\Microsoft Visual Studio\Installer\vswhere.exe"
+) | Where-Object { $_ -and (Test-Path $_) }
+
+$msbuild = $null
+foreach ($vswhere in $vswhereCandidates) {
+    $candidate = & $vswhere -latest -products * -version "[17.0,19.0)" -requires Microsoft.Component.MSBuild -find "MSBuild\Current\Bin\MSBuild.exe" 2>$null |
+        Select-Object -First 1
+    if ($candidate -and (Test-Path $candidate)) {
+        $msbuild = $candidate
+        break
+    }
 }
+
+if (-not $msbuild) {
+    $msbuildCandidates = foreach ($majorVersion in "18", "17") {
+        foreach ($programFilesDirectory in @($env:ProgramFiles, ${env:ProgramFiles(x86)})) {
+            foreach ($edition in "Enterprise", "Professional", "Community", "BuildTools") {
+                if ($programFilesDirectory) {
+                    Join-Path $programFilesDirectory "Microsoft Visual Studio\$majorVersion\$edition\MSBuild\Current\Bin\MSBuild.exe"
+                }
+            }
+        }
+    }
+    $msbuild = $msbuildCandidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+}
+if (-not $msbuild) {
+    throw "No se encontró MSBuild 17 ni 18. Instala Visual Studio o Build Tools con MSBuild y las herramientas de Windows App SDK."
+}
+
+Write-Host "MSBuild detectado: $msbuild"
 
 $uninstallRegistryPaths = @(
     "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*",

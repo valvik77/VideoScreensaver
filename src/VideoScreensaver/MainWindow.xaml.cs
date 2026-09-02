@@ -49,6 +49,7 @@ public sealed partial class MainWindow : Window
         _ = LoadInitialDataAsync();
         _ = Task.Run(VideoLibrary.PurgeStaleThumbnailCache);
         _ = Task.Run(() => VideoCacheService.PurgeOldEntries(TimeSpan.FromDays(7)));
+        _ = Task.Run(() => VideoCacheService.PurgeIncompleteDownloads(TimeSpan.FromDays(1)));
 
         AppWindow.Closing += (_, _) => _videoPreviewWindow?.PrepareForOwnerClose();
         Closed += (_, _) =>

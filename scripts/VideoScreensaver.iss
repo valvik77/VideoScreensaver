@@ -24,7 +24,7 @@ Source: "..\artifacts\publish\*"; DestDir: "{app}"; Excludes: "*.pdb"; Flags: ig
 Source: "..\artifacts\publish\VideoScreensaver.exe"; DestDir: "{app}"; DestName: "VideoScreensaver.scr"; Flags: ignoreversion
 
 [Registry]
-Root: HKCU; Subkey: "Control Panel\Desktop"; ValueType: string; ValueName: "SCRNSAVE.EXE"; ValueData: "{app}\VideoScreensaver.scr"
+Root: HKCU; Subkey: "Control Panel\Desktop"; ValueType: string; ValueName: "SCRNSAVE.EXE"; ValueData: """{app}\VideoScreensaver.scr"""
 
 [Icons]
 Name: "{group}\Configurar Video Screensaver"; Filename: "{app}\VideoScreensaver.exe"; Parameters: "/c"
@@ -41,7 +41,7 @@ begin
   if CurUninstallStep = usUninstall then
   begin
     if RegQueryStringValue(HKCU, 'Control Panel\Desktop', 'SCRNSAVE.EXE', SelectedScreenSaver)
-      and (CompareText(SelectedScreenSaver, ExpandConstant('{app}\VideoScreensaver.scr')) = 0) then
+      and (CompareText(RemoveQuotes(SelectedScreenSaver), ExpandConstant('{app}\VideoScreensaver.scr')) = 0) then
     begin
       RegDeleteValue(HKCU, 'Control Panel\Desktop', 'SCRNSAVE.EXE');
     end;

@@ -9,8 +9,10 @@ $ErrorActionPreference = "Stop"
 $repositoryRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 $artifactsDirectory = Join-Path $repositoryRoot "artifacts"
 $publishDirectory = Join-Path $artifactsDirectory "publish"
+$stubPublishDirectory = Join-Path $artifactsDirectory "publish-stub"
 $installerDirectory = Join-Path $artifactsDirectory "installer"
 $projectPath = Join-Path $repositoryRoot "src\VideoScreensaver\VideoScreensaver.csproj"
+$stubProjectPath = Join-Path $repositoryRoot "src\ScreenSaverStub\ScreenSaverStub.csproj"
 $installerScript = Join-Path $PSScriptRoot "VideoScreensaver.iss"
 
 $vswhereCandidates = @(
@@ -63,12 +65,20 @@ if (-not $innoCompiler) {
 if (Test-Path $publishDirectory) {
     Get-ChildItem -Path $publishDirectory -Force | Remove-Item -Recurse -Force
 }
+if (Test-Path $stubPublishDirectory) {
+    Get-ChildItem -Path $stubPublishDirectory -Force | Remove-Item -Recurse -Force
+}
 
-New-Item -ItemType Directory -Force -Path $publishDirectory, $installerDirectory | Out-Null
+New-Item -ItemType Directory -Force -Path $publishDirectory, $stubPublishDirectory, $installerDirectory | Out-Null
 
 & $msbuild $projectPath /restore /t:Publish "/p:Configuration=$Configuration" /p:Platform=x64 /p:RuntimeIdentifier=win-x64 /p:SelfContained=true "/p:PublishDir=$publishDirectory\"
 if ($LASTEXITCODE -ne 0) {
     throw "La publicación de la aplicación falló con código de salida $LASTEXITCODE."
+}
+
+& $msbuild $stubProjectPath /restore /t:Publish "/p:Configuration=$Configuration" /p:Platform=x64 /p:RuntimeIdentifier=win-x64 /p:SelfContained=true "/p:PublishDir=$stubPublishDirectory\"
+if ($LASTEXITCODE -ne 0) {
+    throw "La publicación del lanzador (stub) del protector de pantalla falló con código de salida $LASTEXITCODE."
 }
 
 $application = Get-Item (Join-Path $publishDirectory "VideoScreensaver.exe")

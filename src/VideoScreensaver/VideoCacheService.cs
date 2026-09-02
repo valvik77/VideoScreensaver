@@ -73,10 +73,7 @@ public static class VideoCacheService
         }
         finally
         {
-            if (File.Exists(tempFile))
-            {
-                File.Delete(tempFile);
-            }
+            TryDeleteTemporaryFile(tempFile);
         }
     }
 
@@ -106,6 +103,22 @@ public static class VideoCacheService
         catch
         {
             // Cache cleanup is best effort only.
+        }
+    }
+
+    private static void TryDeleteTemporaryFile(string temporaryFile)
+    {
+        try
+        {
+            if (File.Exists(temporaryFile))
+            {
+                File.Delete(temporaryFile);
+            }
+        }
+        catch
+        {
+            // A cleanup failure must not mask a download/cancellation error. The periodic
+            // incomplete-download purge will make another best-effort attempt later.
         }
     }
 

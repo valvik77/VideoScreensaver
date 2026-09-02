@@ -82,10 +82,7 @@ public static class SettingsService
         }
         finally
         {
-            if (File.Exists(temporaryFile))
-            {
-                File.Delete(temporaryFile);
-            }
+            TryDeleteTemporaryFile(temporaryFile);
         }
     }
 
@@ -122,6 +119,21 @@ public static class SettingsService
         catch (Exception exception) when (exception is FormatException or CryptographicException)
         {
             return null;
+        }
+    }
+
+    private static void TryDeleteTemporaryFile(string temporaryFile)
+    {
+        try
+        {
+            if (File.Exists(temporaryFile))
+            {
+                File.Delete(temporaryFile);
+            }
+        }
+        catch
+        {
+            // Cleanup is best effort. Never hide the exception that caused Save to fail.
         }
     }
 

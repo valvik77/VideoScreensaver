@@ -1,4 +1,6 @@
+using System.ComponentModel;
 using System.IO;
+using System.Runtime.CompilerServices;
 
 namespace VideoScreensaver;
 
@@ -27,7 +29,7 @@ public sealed class PlaylistItem
         ThumbnailHelper.CreateSafeBitmapImage(thumbnailUri);
 }
 
-public sealed class VideoGalleryItem
+public sealed class VideoGalleryItem : INotifyPropertyChanged
 {
     public string Id { get; set; } = Guid.NewGuid().ToString("N");
     public string Title { get; set; } = string.Empty;
@@ -38,15 +40,33 @@ public sealed class VideoGalleryItem
     public int Duration { get; set; }
     public string Tags { get; set; } = string.Empty;
     public string Subtitle { get; set; } = string.Empty;
-    public bool IsInPlaylist { get; set; }
+    private bool _isInPlaylist;
+    public bool IsInPlaylist
+    {
+        get => _isInPlaylist;
+        set
+        {
+            if (_isInPlaylist == value) return;
+            _isInPlaylist = value;
+            OnPropertyChanged();
+        }
+    }
 
     public string DurationText => DurationFormatter.Format(Duration);
 
     public Microsoft.UI.Xaml.Visibility VisibleIfHasText(string text) =>
         string.IsNullOrEmpty(text) ? Microsoft.UI.Xaml.Visibility.Collapsed : Microsoft.UI.Xaml.Visibility.Visible;
 
+    public Microsoft.UI.Xaml.Visibility VisibleIf(bool value) =>
+        value ? Microsoft.UI.Xaml.Visibility.Visible : Microsoft.UI.Xaml.Visibility.Collapsed;
+
     public Microsoft.UI.Xaml.Media.Imaging.BitmapImage? SafeImageSource(string thumbnailUri) =>
         ThumbnailHelper.CreateSafeBitmapImage(thumbnailUri);
+
+    public event PropertyChangedEventHandler? PropertyChanged;
+
+    private void OnPropertyChanged([CallerMemberName] string? propertyName = null) =>
+        PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(propertyName));
 }
 
 /// <summary>

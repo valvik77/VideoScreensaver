@@ -92,6 +92,7 @@ public sealed partial class MainWindow : Window
             _playlist.Add(item);
         }
         UpdatePlaylistUiState();
+        RefreshGalleryPlaylistMarkers();
 
         ShuffleToggle.Toggled += (_, _) => AutoSaveSettings();
         MuteToggle.Toggled += (_, _) => AutoSaveSettings();
@@ -138,6 +139,23 @@ public sealed partial class MainWindow : Window
         PlaylistCountBadge.Text = count == 1 ? "1 vídeo seleccionado" : $"{count} vídeos seleccionados";
         EmptyPlaylistState.Visibility = count == 0 ? Visibility.Visible : Visibility.Collapsed;
         PlaylistGrid.Visibility = count > 0 ? Visibility.Visible : Visibility.Collapsed;
+    }
+
+    private void RefreshGalleryPlaylistMarkers()
+    {
+        var playlistUris = new HashSet<string>(
+            _playlist.Select(item => item.VideoUri),
+            StringComparer.OrdinalIgnoreCase);
+
+        foreach (var item in _pixabayItems)
+        {
+            item.IsInPlaylist = playlistUris.Contains(item.VideoUri);
+        }
+
+        foreach (var item in _localItems)
+        {
+            item.IsInPlaylist = playlistUris.Contains(item.VideoUri);
+        }
     }
 
     private void AutoSaveSettings()
@@ -211,6 +229,7 @@ public sealed partial class MainWindow : Window
         {
             _localItems.Add(item);
         }
+        RefreshGalleryPlaylistMarkers();
 
         EmptyLocalState.Visibility = _localItems.Count == 0 ? Visibility.Visible : Visibility.Collapsed;
         LocalGrid.Visibility = _localItems.Count > 0 ? Visibility.Visible : Visibility.Collapsed;
@@ -247,6 +266,7 @@ public sealed partial class MainWindow : Window
 
         AutoSaveSettings();
         UpdatePlaylistUiState();
+        RefreshGalleryPlaylistMarkers();
         ShowNotification("Vídeos añadidos", $"Se han añadido {addedCount} vídeos locales a la lista de reproducción.");
     }
 
@@ -325,6 +345,8 @@ public sealed partial class MainWindow : Window
                     _pixabayItems.Clear();
                     foreach (var item in result.Items)
                     {
+                        item.IsInPlaylist = _playlist.Any(playlistItem =>
+                            string.Equals(playlistItem.VideoUri, item.VideoUri, StringComparison.OrdinalIgnoreCase));
                         _pixabayItems.Add(item);
                     }
 
@@ -516,6 +538,7 @@ public sealed partial class MainWindow : Window
 
         AutoSaveSettings();
         UpdatePlaylistUiState();
+        RefreshGalleryPlaylistMarkers();
         ShowNotification("Añadido", $"'{item.Title}' se ha añadido al salvapantallas.");
     }
 
@@ -529,6 +552,7 @@ public sealed partial class MainWindow : Window
             _playlist.Remove(item);
             AutoSaveSettings();
             UpdatePlaylistUiState();
+            RefreshGalleryPlaylistMarkers();
             ShowNotification("Eliminado", $"'{item.Title}' eliminado de la lista.");
         }
     }
@@ -585,6 +609,7 @@ public sealed partial class MainWindow : Window
         _playlist.Clear();
         AutoSaveSettings();
         UpdatePlaylistUiState();
+        RefreshGalleryPlaylistMarkers();
         ShowNotification("Lista vaciada", "Se han eliminado todos los vídeos de la lista de reproducción.");
     }
 

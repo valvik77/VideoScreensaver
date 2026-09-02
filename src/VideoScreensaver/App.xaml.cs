@@ -14,12 +14,16 @@ public partial class App : Application
         UnhandledException += (sender, e) =>
         {
             AppDiagnostics.LogUnhandledException(e.Exception, "WinUI UnhandledException");
-            e.Handled = true;
             if (!_isScreenSaverMode && !_hasShownUnhandledError)
             {
                 _hasShownUnhandledError = true;
                 AppDiagnostics.ShowControlledError();
             }
+
+            // Do not keep running after an unknown UI-thread failure: marking every exception as
+            // handled can leave WinUI controls and media resources in an inconsistent state.
+            // The exception remains unhandled so Windows terminates the process predictably.
+            e.Handled = false;
         };
 
         AppDomain.CurrentDomain.UnhandledException += (_, e) =>

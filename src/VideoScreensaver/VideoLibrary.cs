@@ -19,20 +19,31 @@ public static class VideoLibrary
         "VideoScreensaver",
         "thumbnails");
 
-    public static IReadOnlyList<string> GetVideos(string? folder) =>
-        string.IsNullOrWhiteSpace(folder) || !Directory.Exists(folder)
-            ? []
-            : Directory.EnumerateFiles(folder, "*", SearchOption.TopDirectoryOnly)
-                .Where(path => Extensions.Contains(Path.GetExtension(path)))
-                .ToList();
-
-    public static async Task<IReadOnlyList<VideoGalleryItem>> GetGalleryItemsAsync(string? folder)
+    public static IReadOnlyList<string> GetVideos(string? folder)
     {
-        var paths = GetVideos(folder);
+        if (string.IsNullOrWhiteSpace(folder) || !Directory.Exists(folder)) return [];
+        try
+        {
+            return Directory.EnumerateFiles(folder, "*", new EnumerationOptions
+            {
+                RecurseSubdirectories = false, IgnoreInaccessible = true
+            }).Where(path => Extensions.Contains(Path.GetExtension(path))).ToList();
+        }
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
+        {
+            AppDiagnostics.LogUnhandledException(exception, "Enumerate video folder");
+            return [];
+        }
+    }
+
+    public static async Task<IReadOnlyList<VideoGalleryItem>> GetGalleryItemsAsync(string? folder, CancellationToken cancellationToken = default)
+    {
+        var paths = await Task.Run(() => GetVideos(folder), cancellationToken);
         var items = new List<VideoGalleryItem>();
 
         foreach (var path in paths)
         {
+            cancellationToken.ThrowIfCancellationRequested();
             try
             {
                 var fileInfo = new FileInfo(path);
@@ -56,15 +67,23 @@ public static class VideoLibrary
             }
         }
 
-        foreach (var item in items)
+        // Bound shell/decoder work while allowing large folders to load faster.
+        using var gate = new SemaphoreSlim(4);
+        await Task.WhenAll(items.Select(async item =>
         {
-            item.ThumbnailUri = await GetOrCreateThumbnailAsync(item.VideoUri);
-            item.Duration = await GetVideoDurationSecondsAsync(item.VideoUri);
-            if (item.Duration > 0)
+            await gate.WaitAsync(cancellationToken);
+            try
             {
-                item.Subtitle = $"{item.Subtitle} • {DurationFormatter.Format(item.Duration)}";
+                cancellationToken.ThrowIfCancellationRequested();
+                item.ThumbnailUri = await GetOrCreateThumbnailAsync(item.VideoUri, cancellationToken);
+                cancellationToken.ThrowIfCancellationRequested();
+                item.Duration = await GetVideoDurationSecondsAsync(item.VideoUri);
+                if (item.Duration > 0)
+                    item.Subtitle = $"{item.Subtitle} • {DurationFormatter.Format(item.Duration)}";
             }
-        }
+            finally { gate.Release(); }
+        }));
+        cancellationToken.ThrowIfCancellationRequested();
 
         return items;
     }
@@ -93,8 +112,9 @@ public static class VideoLibrary
     /// and caches it to disk as a JPEG so it can be reused as an Image source without
     /// re-extracting it on every gallery load.
     /// </summary>
-    private static async Task<string> GetOrCreateThumbnailAsync(string videoPath)
+    private static async Task<string> GetOrCreateThumbnailAsync(string videoPath, CancellationToken cancellationToken)
     {
+        string? temporaryFile = null;
         try
         {
             Directory.CreateDirectory(ThumbnailCacheDirectory);
@@ -116,15 +136,25 @@ public static class VideoLibrary
             }
 
             using var stream = thumbnail.AsStreamForRead();
-            using var fileStream = File.Create(cachedFile);
-            await stream.CopyToAsync(fileStream);
-
+            temporaryFile = $"{cachedFile}.{Guid.NewGuid():N}.tmp";
+            using (var fileStream = File.Create(temporaryFile))
+                await stream.CopyToAsync(fileStream, cancellationToken);
+            File.Move(temporaryFile, cachedFile, overwrite: true);
             return cachedFile;
         }
+        catch (OperationCanceledException) { throw; }
         catch
         {
             // Thumbnail extraction can fail for corrupt/unsupported files; fall back to no thumbnail.
             return string.Empty;
+        }
+        finally
+        {
+            if (temporaryFile is not null)
+            {
+                try { File.Delete(temporaryFile); } catch (IOException) { }
+                catch (UnauthorizedAccessException) { }
+            }
         }
     }
 
@@ -154,7 +184,8 @@ public static class VideoLibrary
             foreach (var file in Directory.EnumerateFiles(ThumbnailCacheDirectory, "*.jpg"))
             {
                 var fileName = Path.GetFileName(file);
-                if (CurrentCacheFileNamePattern.IsMatch(fileName))
+                if (CurrentCacheFileNamePattern.IsMatch(fileName)
+                    && File.GetLastWriteTimeUtc(file) > DateTime.UtcNow.AddDays(-30))
                 {
                     continue;
                 }

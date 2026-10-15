@@ -23,6 +23,7 @@ public sealed partial class VideoPreviewWindow : Window
     private bool _isLoaded;
     private bool _isDismissed;
     private bool _allowClose;
+    private bool _isClosing;
     private bool _isClosed;
     private bool _escapeHotKeyRegistered;
     private Microsoft.UI.Dispatching.DispatcherQueueTimer? _focusRetryTimer;
@@ -40,13 +41,13 @@ public sealed partial class VideoPreviewWindow : Window
         Player.MediaPlayer.MediaEnded += (_, _) => DispatcherQueue.TryEnqueue(DismissPreview);
         Player.MediaPlayer.MediaOpened += (_, _) => DispatcherQueue.TryEnqueue(() =>
         {
-            if (_isDismissed) return;
+            if (_isDismissed || _isClosing || _isClosed) return;
             LoadingPanel.Visibility = Visibility.Collapsed;
             Player.MediaPlayer.Play();
         });
         Player.MediaPlayer.MediaFailed += (_, args) => DispatcherQueue.TryEnqueue(() =>
         {
-            if (_isDismissed) return;
+            if (_isDismissed || _isClosing || _isClosed) return;
             LoadingPanel.Visibility = Visibility.Visible;
             LoadingText.Text = $"No se pudo reproducir el vídeo.\n{args.ErrorMessage}";
         });
@@ -58,8 +59,9 @@ public sealed partial class VideoPreviewWindow : Window
             _focusRetryTimer?.Stop();
             _loadingCancellation?.Cancel();
             RestoreWindowProcedure();
-            Player.Source = null;
-            Player.MediaPlayer.Dispose();
+            var player = Player.MediaPlayer;
+            Player.SetMediaPlayer(null);
+            MediaPlayerCleanup.Release(player);
             _loadingCancellation?.Dispose();
             _loadingCancellation = null;
         };
@@ -67,7 +69,7 @@ public sealed partial class VideoPreviewWindow : Window
         Root.Loaded += Root_Loaded;
     }
 
-    private async void Root_Loaded(object sender, RoutedEventArgs e)
+    private void Root_Loaded(object sender, RoutedEventArgs e)
     {
         _windowHandle = WindowNative.GetWindowHandle(this);
         if (_ownerHandle != 0)
@@ -94,21 +96,25 @@ public sealed partial class VideoPreviewWindow : Window
 
     public void Shutdown()
     {
-        if (_isClosed) return;
+        if (_isClosed || _isClosing) return;
+        _isClosing = true;
         _allowClose = true;
         _loadingCancellation?.Cancel();
-        Close();
+        AppWindow.Destroy();
     }
 
     public void PrepareForOwnerClose()
     {
         // The owner is about to be destroyed. Do not intercept the WM_CLOSE that Windows sends
         // to this owned window, otherwise the preview can survive as an orphaned fullscreen HWND.
+        if (_isClosed || _isClosing) return;
+        _isClosing = true;
         _allowClose = true;
         _focusRetryTimer?.Stop();
         UnregisterPreviewHotKey();
         _loadingCancellation?.Cancel();
         ReleaseTopmostCore();
+        AppWindow.Destroy();
     }
 
     private async void PresentAndLoadVideo()
@@ -169,7 +175,7 @@ public sealed partial class VideoPreviewWindow : Window
         }
         catch (Exception ex)
         {
-            if (!_isDismissed)
+            if (!_isDismissed && !_isClosing && !cancellationToken.IsCancellationRequested)
             {
                 LoadingText.Text = $"No se pudo abrir el vídeo.\n{ex.Message}";
             }
@@ -256,7 +262,7 @@ public sealed partial class VideoPreviewWindow : Window
 
     private void DismissPreview()
     {
-        if (_isDismissed) return;
+        if (_isDismissed || _isClosing || _isClosed) return;
         _isDismissed = true;
         _focusRetryTimer?.Stop();
         UnregisterPreviewHotKey();
@@ -270,7 +276,7 @@ public sealed partial class VideoPreviewWindow : Window
 
     private void FocusPreviewWindow()
     {
-        if (_isDismissed) return;
+        if (_isDismissed || _isClosing || _isClosed) return;
         Activate();
         BringWindowToTop(_windowHandle);
         SetForegroundWindow(_windowHandle);

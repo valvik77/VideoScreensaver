@@ -25,6 +25,14 @@ public sealed partial class MainWindow : Window
     private int _pixabayPage = 1;
     private int _pixabayTotalPages = 1;
     private bool _isInitialized;
+    private bool _isClosing;
+    private bool _closeRequested;
+    private bool _closeAfterSave;
+    private readonly CancellationTokenSource _lifetimeCancellation = new();
+    private CancellationTokenSource? _localLoadCancellation;
+    private readonly Microsoft.UI.Dispatching.DispatcherQueueTimer _saveTimer;
+    private Task<bool> _saveTask = Task.FromResult(true);
+    private bool _settingsDirty;
     private ScreenSaverWindow? _testWindow;
     private VideoPreviewWindow? _videoPreviewWindow;
 
@@ -32,6 +40,10 @@ public sealed partial class MainWindow : Window
     {
         InitializeComponent();
         _settings = SettingsService.Load();
+        _saveTimer = DispatcherQueue.CreateTimer();
+        _saveTimer.Interval = TimeSpan.FromMilliseconds(400);
+        _saveTimer.IsRepeating = false;
+        _saveTimer.Tick += async (_, _) => await FlushSettingsAsync();
 
         ConfigureWindowSize();
 
@@ -49,11 +61,31 @@ public sealed partial class MainWindow : Window
 
         _ = LoadInitialDataAsync();
         _ = Task.Run(VideoLibrary.PurgeStaleThumbnailCache);
-        _ = Task.Run(() => VideoCacheService.PurgeOldEntries(TimeSpan.FromDays(7)));
-        _ = Task.Run(() => VideoCacheService.PurgeIncompleteDownloads(TimeSpan.FromDays(1)));
 
-        AppWindow.Closing += (_, _) =>
+        AppWindow.Closing += async (_, args) =>
         {
+            if (!_closeAfterSave)
+            {
+                args.Cancel = true;
+                if (_closeRequested) return;
+                _closeRequested = true;
+                Root.IsHitTestVisible = false;
+                if (await FlushSettingsAsync())
+                {
+                    _closeAfterSave = true;
+                    DispatcherQueue.TryEnqueue(Close);
+                }
+                else
+                {
+                    Root.IsHitTestVisible = true;
+                    _closeRequested = false;
+                }
+                return;
+            }
+            _isClosing = true;
+            _saveTimer.Stop();
+            _localLoadCancellation?.Cancel();
+            _lifetimeCancellation.Cancel();
             _videoPreviewWindow?.PrepareForOwnerClose();
             _testWindow?.RequestClose();
             DisposeMediaPlayers(Root);
@@ -169,13 +201,50 @@ public sealed partial class MainWindow : Window
 
     private void AutoSaveSettings()
     {
+        if (!_isInitialized || _isClosing) return;
         _settings.VideoFolder = FolderTextBox.Text.Trim();
         _settings.Shuffle = ShuffleToggle.IsOn;
         _settings.Mute = MuteToggle.IsOn;
         _settings.FadeSeconds = FadeDurationSlider.Value;
         _settings.PixabayApiKey = PixabayApiKeyBox.Text.Trim();
         _settings.Playlist = _playlist.ToList();
-        SettingsService.Save(_settings);
+        _settingsDirty = true;
+        _saveTimer.Stop();
+        _saveTimer.Start();
+    }
+
+    private Task<bool> FlushSettingsAsync()
+    {
+        _saveTimer.Stop();
+        if (!_settingsDirty) return _saveTask;
+        _settingsDirty = false;
+        var snapshot = new AppSettings
+        {
+            VideoFolder = _settings.VideoFolder, Shuffle = _settings.Shuffle,
+            Mute = _settings.Mute, FadeSeconds = _settings.FadeSeconds,
+            PixabayApiKey = _settings.PixabayApiKey, Playlist = _settings.Playlist.ToList(),
+            CacheLimitMb = _settings.CacheLimitMb, MaxDownloadMb = _settings.MaxDownloadMb
+        };
+        return _saveTask = SaveSnapshotAsync(snapshot, _saveTask);
+    }
+
+    private async Task<bool> SaveSnapshotAsync(AppSettings snapshot, Task<bool> previous)
+    {
+        await previous;
+        try
+        {
+            await Task.Run(() => SettingsService.Save(snapshot));
+            return true;
+        }
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException
+            or System.Security.Cryptography.CryptographicException or System.Text.Json.JsonException)
+        {
+            _settingsDirty = true;
+            AppDiagnostics.LogUnhandledException(exception, "Save settings");
+            if (!_isClosing)
+                ShowNotification("No se pudo guardar", "Los cambios siguen en memoria. Comprueba el espacio y los permisos; se reintentará al guardar de nuevo.", InfoBarSeverity.Error);
+            return false;
+        }
     }
 
     private void ShowNotification(string title, string message, InfoBarSeverity severity = InfoBarSeverity.Success)
@@ -217,31 +286,35 @@ public sealed partial class MainWindow : Window
 
     private async void FolderTextBox_TextChanged(object sender, TextChangedEventArgs e)
     {
-        var path = FolderTextBox.Text.Trim();
-        if (Directory.Exists(path))
-        {
-            await LoadLocalVideosAsync(path);
-        }
+        if (!_isInitialized || _isClosing) return;
+        AutoSaveSettings();
+        await LoadLocalVideosAsync(FolderTextBox.Text.Trim(), debounce: true);
     }
 
-    private async Task LoadLocalVideosAsync(string folderPath)
+    private async Task LoadLocalVideosAsync(string folderPath, bool debounce = false)
     {
-        // Guard against overlapping loads (e.g. rapid typing or picker + TextChanged firing
-        // together): only the most recent call is allowed to update the UI collection.
+        _localLoadCancellation?.Cancel();
+        _localLoadCancellation?.Dispose();
+        _localLoadCancellation = CancellationTokenSource.CreateLinkedTokenSource(_lifetimeCancellation.Token);
+        var cancellationToken = _localLoadCancellation.Token;
         var token = ++_localLoadToken;
-        var items = await VideoLibrary.GetGalleryItemsAsync(folderPath);
-
-        if (token != _localLoadToken) return;
-
-        _localItems.Clear();
-        foreach (var item in items)
+        try
         {
-            _localItems.Add(item);
+            if (debounce) await Task.Delay(300, cancellationToken);
+            var items = await VideoLibrary.GetGalleryItemsAsync(folderPath, cancellationToken);
+            if (_isClosing || token != _localLoadToken || cancellationToken.IsCancellationRequested) return;
+            _localItems.Clear();
+            foreach (var item in items) _localItems.Add(item);
+            RefreshGalleryPlaylistMarkers();
+            EmptyLocalState.Visibility = _localItems.Count == 0 ? Visibility.Visible : Visibility.Collapsed;
+            LocalGrid.Visibility = _localItems.Count > 0 ? Visibility.Visible : Visibility.Collapsed;
         }
-        RefreshGalleryPlaylistMarkers();
-
-        EmptyLocalState.Visibility = _localItems.Count == 0 ? Visibility.Visible : Visibility.Collapsed;
-        LocalGrid.Visibility = _localItems.Count > 0 ? Visibility.Visible : Visibility.Collapsed;
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { }
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or ArgumentException)
+        {
+            if (!_isClosing && token == _localLoadToken)
+                ShowNotification("No se pudo leer la carpeta", exception.Message, InfoBarSeverity.Error);
+        }
     }
 
     private void AddAllLocalButton_Click(object sender, RoutedEventArgs e)
@@ -311,7 +384,7 @@ public sealed partial class MainWindow : Window
 
     private async Task SearchPixabayAsync()
     {
-        if (PixabayLoadingRing == null) return;
+        if (PixabayLoadingRing == null || _isClosing) return;
 
         // Ignore overlapping calls (e.g. rapid category changes) to avoid spamming Pixabay
         // and triggering 429 Too Many Requests; only the latest request's result is applied.
@@ -347,7 +420,10 @@ public sealed partial class MainWindow : Window
                         category,
                         page: _pixabayPage,
                         perPage: 20,
-                        customApiKey: _settings.PixabayApiKey);
+                        customApiKey: _settings.PixabayApiKey,
+                        cancellationToken: _lifetimeCancellation.Token);
+
+                    if (_isClosing) return;
 
                     if (token != _pixabaySearchToken) continue;
 
@@ -363,6 +439,10 @@ public sealed partial class MainWindow : Window
                     PageIndicatorText.Text = $"Página {_pixabayPage} de {_pixabayTotalPages} ({result.TotalHits} resultados)";
                     PrevPageButton.IsEnabled = _pixabayPage > 1;
                     NextPageButton.IsEnabled = _pixabayPage < _pixabayTotalPages;
+                }
+                catch (OperationCanceledException) when (_lifetimeCancellation.IsCancellationRequested)
+                {
+                    return;
                 }
                 catch (PixabayRateLimitException ex)
                 {
@@ -382,13 +462,16 @@ public sealed partial class MainWindow : Window
                     ShowNotification("Error de conexión con Pixabay", ex.Message, InfoBarSeverity.Error);
                 }
             }
-            while (_pixabaySearchPending);
+            while (_pixabaySearchPending && !_isClosing);
         }
         finally
         {
-            PixabayLoadingRing.IsActive = false;
-            PixabayLoadingRing.Visibility = Visibility.Collapsed;
-            PixabayGrid.Opacity = 1.0;
+            if (!_isClosing)
+            {
+                PixabayLoadingRing.IsActive = false;
+                PixabayLoadingRing.Visibility = Visibility.Collapsed;
+                PixabayGrid.Opacity = 1.0;
+            }
             _pixabaySearchInFlight = false;
         }
     }
@@ -420,6 +503,7 @@ public sealed partial class MainWindow : Window
     {
         _settings.PixabayApiKey = PixabayApiKeyBox.Text.Trim();
         AutoSaveSettings();
+        if (!await FlushSettingsAsync()) return;
         ShowNotification("Clave guardada", "Clave API de Pixabay actualizada.");
         _pixabayPage = 1;
         await SearchPixabayAsync();
@@ -431,6 +515,7 @@ public sealed partial class MainWindow : Window
 
     private void VideoCard_PointerEntered(object sender, PointerRoutedEventArgs e)
     {
+        if (_isClosing) return;
         if (sender is not Grid container) return;
 
         var hoverPlayer = container.Children.OfType<MediaPlayerElement>().FirstOrDefault();
@@ -459,6 +544,7 @@ public sealed partial class MainWindow : Window
 
     private void VideoCard_PointerExited(object sender, PointerRoutedEventArgs e)
     {
+        if (_isClosing) return;
         if (sender is not Grid container) return;
 
         var hoverPlayer = container.Children.OfType<MediaPlayerElement>().FirstOrDefault();
@@ -478,9 +564,9 @@ public sealed partial class MainWindow : Window
 
     private void VideoCard_DoubleTapped(object sender, DoubleTappedRoutedEventArgs e)
     {
+        if (_isClosing) return;
         if (sender is not FrameworkElement container) return;
 
-        e.Handled = true;
 
         // The full-quality video URI (not the low-res hover PreviewUri) lives on the bound item
         // itself; PlaylistItem and VideoGalleryItem both expose it as VideoUri.
@@ -526,9 +612,9 @@ public sealed partial class MainWindow : Window
         {
             try
             {
-                mediaElement.Source = null;
-                mediaElement.MediaPlayer.CommandManager.IsEnabled = false;
-                mediaElement.MediaPlayer.Dispose();
+                var player = mediaElement.MediaPlayer;
+                mediaElement.SetMediaPlayer(null);
+                MediaPlayerCleanup.Release(player);
             }
             catch
             {
@@ -558,12 +644,10 @@ public sealed partial class MainWindow : Window
 
     private void AddGalleryItem_Click(object sender, RoutedEventArgs e)
     {
-        if (sender is not Button { Tag: string itemId }) return;
-
-        var item = _localItems.FirstOrDefault(i => i.Id == itemId) ??
-                   _pixabayItems.FirstOrDefault(i => i.Id == itemId);
-
-        if (item == null) return;
+        // Read the item directly from the pressed button. Looking it up again by Id can
+        // fail when a virtualised Pixabay card is being refreshed while its hover video
+        // is initialising.
+        if (sender is not Button { DataContext: VideoGalleryItem item }) return;
 
         if (_playlist.Any(p => p.VideoUri == item.VideoUri))
         {
@@ -658,9 +742,10 @@ public sealed partial class MainWindow : Window
         ShowNotification("Lista vaciada", "Se han eliminado todos los vídeos de la lista de reproducción.");
     }
 
-    private void TestButton_Click(object sender, RoutedEventArgs e)
+    private async void TestButton_Click(object sender, RoutedEventArgs e)
     {
         AutoSaveSettings();
+        if (!await FlushSettingsAsync() || _isClosing) return;
         _testWindow?.RequestClose();
 
         ScreenSaverWindow? testWindow = null;

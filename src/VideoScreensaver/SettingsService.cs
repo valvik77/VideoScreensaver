@@ -10,6 +10,8 @@ public sealed class AppSettings
     public bool Shuffle { get; set; } = true;
     public bool Mute { get; set; } = true;
     public double FadeSeconds { get; set; } = 6.0;
+    public int CacheLimitMb { get; set; } = 2048;
+    public int MaxDownloadMb { get; set; } = 512;
     [System.Text.Json.Serialization.JsonIgnore]
     public string PixabayApiKey { get; set; } = string.Empty;
     public List<PlaylistItem> Playlist { get; set; } = [];
@@ -33,7 +35,8 @@ public static class SettingsService
                 return new AppSettings();
             }
 
-            var playlist = persisted.Playlist ?? [];
+            var playlist = (persisted.Playlist ?? [])
+                .Where(item => item is not null && !string.IsNullOrWhiteSpace(item.VideoUri)).ToList();
             foreach (var item in playlist.Where(item => item.SourceType == VideoSourceType.Pixabay))
             {
                 // Migrate existing playlists too; otherwise only newly-added gallery items would
@@ -46,7 +49,9 @@ public static class SettingsService
                 VideoFolder = persisted.VideoFolder ?? string.Empty,
                 Shuffle = persisted.Shuffle,
                 Mute = persisted.Mute,
-                FadeSeconds = persisted.FadeSeconds,
+                FadeSeconds = double.IsFinite(persisted.FadeSeconds) ? Math.Clamp(persisted.FadeSeconds, 0.5, 30) : 6,
+                CacheLimitMb = Math.Clamp(persisted.CacheLimitMb, 64, 102400),
+                MaxDownloadMb = Math.Clamp(persisted.MaxDownloadMb, 16, Math.Clamp(persisted.CacheLimitMb, 64, 102400)),
                 Playlist = playlist,
                 // PixabayApiKey is retained solely to migrate configurations created before
                 // DPAPI protection was introduced. It is never written again.
@@ -54,7 +59,7 @@ public static class SettingsService
                                 persisted.PixabayApiKey ?? string.Empty
             };
         }
-        catch (Exception exception) when (exception is IOException or JsonException or CryptographicException)
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or JsonException or CryptographicException)
         {
             return new AppSettings();
         }
@@ -78,6 +83,8 @@ public static class SettingsService
             Shuffle = settings.Shuffle,
             Mute = settings.Mute,
             FadeSeconds = settings.FadeSeconds,
+            CacheLimitMb = settings.CacheLimitMb,
+            MaxDownloadMb = settings.MaxDownloadMb,
             Playlist = settings.Playlist,
             PixabayApiKeyProtected = ProtectApiKey(settings.PixabayApiKey)
         };
@@ -151,6 +158,8 @@ public static class SettingsService
         public bool Shuffle { get; set; } = true;
         public bool Mute { get; set; } = true;
         public double FadeSeconds { get; set; } = 6.0;
+        public int CacheLimitMb { get; set; } = 2048;
+        public int MaxDownloadMb { get; set; } = 512;
         public string? PixabayApiKey { get; set; }
         public string? PixabayApiKeyProtected { get; set; }
         public List<PlaylistItem>? Playlist { get; set; }

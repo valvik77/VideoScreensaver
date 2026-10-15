@@ -96,7 +96,7 @@
                                       Tag="{x:Bind VideoUri}">
                                     <Image Source="{x:Bind SafeImageSource(ThumbnailUri)}" Stretch="UniformToFill" />
                                     <MediaPlayerElement x:Name="HoverPlayer" Stretch="UniformToFill" AutoPlay="False"
-                                                        AreTransportControlsEnabled="False" Visibility="Collapsed" />
+                                                        AreTransportControlsEnabled="False" Visibility="Collapsed" IsHitTestVisible="False" />
                                     <Border Background="#99000000" HorizontalAlignment="Left" VerticalAlignment="Bottom"
                                             Padding="6,3" Margin="6" CornerRadius="4" Visibility="{x:Bind VisibleIfHasText(DurationText)}">
                                         <TextBlock Text="{x:Bind DurationText}" FontSize="11" Foreground="White" />
@@ -211,7 +211,7 @@
                                       Tag="{x:Bind PreviewUri}">
                                     <Image Source="{x:Bind SafeImageSource(ThumbnailUri)}" Stretch="UniformToFill" />
                                     <MediaPlayerElement x:Name="HoverPlayer" Stretch="UniformToFill" AutoPlay="False"
-                                                        AreTransportControlsEnabled="False" Visibility="Collapsed" />
+                                                        AreTransportControlsEnabled="False" Visibility="Collapsed" IsHitTestVisible="False" />
                                     <Border Background="#99000000" HorizontalAlignment="Left" VerticalAlignment="Bottom"
                                             Padding="6,3" Margin="6" CornerRadius="4" Visibility="{x:Bind VisibleIfHasText(DurationText)}">
                                         <TextBlock Text="{x:Bind DurationText}" FontSize="11" Foreground="White" />
@@ -296,7 +296,7 @@
                                                     <FontIcon Glyph="&#xE714;" FontSize="36" Foreground="Gray" HorizontalAlignment="Center" VerticalAlignment="Center" />
                                                                     <Image Source="{x:Bind SafeImageSource(ThumbnailUri)}" Stretch="UniformToFill" />
                                                                     <MediaPlayerElement x:Name="HoverPlayer" Stretch="UniformToFill" AutoPlay="False"
-                                                                                        AreTransportControlsEnabled="False" Visibility="Collapsed" />
+                                                                                        AreTransportControlsEnabled="False" Visibility="Collapsed" IsHitTestVisible="False" />
                                                                     <Border Background="#99000000" HorizontalAlignment="Left" VerticalAlignment="Bottom"
                                                                             Padding="6,3" Margin="6" CornerRadius="4" Visibility="{x:Bind VisibleIfHasText(DurationText)}">
                                                                         <TextBlock Text="{x:Bind DurationText}" FontSize="11" Foreground="White" />

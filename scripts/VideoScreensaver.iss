@@ -16,6 +16,10 @@ SolidCompression=yes
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 PrivilegesRequired=admin
+; The application and the .scr launcher are machine-wide, but Windows stores the selected
+; screensaver per interactive user in HKCU. This is intentional: using HKLM for SCRNSAVE.EXE
+; would not select it for the user. Suppress Inno Setup's generic mixed-scope warning.
+UsedUserAreasWarning=no
 UninstallDisplayIcon={app}\VideoScreensaver.exe
 WizardStyle=modern
 

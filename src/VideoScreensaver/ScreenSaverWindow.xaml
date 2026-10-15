@@ -9,9 +9,9 @@
         <MediaPlayerElement x:Name="PlayerB" AreTransportControlsEnabled="False"
                             AutoPlay="False" Stretch="UniformToFill" Opacity="0" />
         <StackPanel x:Name="EmptyState" HorizontalAlignment="Center" VerticalAlignment="Center" Spacing="12" MaxWidth="400">
-            <TextBlock Text="No hay vídeos para reproducir" HorizontalAlignment="Center"
+            <TextBlock x:Name="EmptyTitle" Text="No hay vídeos para reproducir" HorizontalAlignment="Center"
                        Style="{StaticResource TitleTextBlockStyle}" Foreground="White" TextAlignment="Center" />
-            <TextBlock Text="Abre la configuración y selecciona una carpeta con vídeos compatibles."
+            <TextBlock x:Name="EmptyDescription" Text="Abre la configuración y selecciona una carpeta con vídeos compatibles."
                        Foreground="White" Opacity="0.78" TextWrapping="Wrap" TextAlignment="Center" />
         </StackPanel>
     </Grid>

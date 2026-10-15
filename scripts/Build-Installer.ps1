@@ -62,12 +62,29 @@ if (-not $innoCompiler) {
     throw "No se encontró Inno Setup 7 (ISCC.exe). Instálalo antes de crear el instalador."
 }
 
-if (Test-Path $publishDirectory) {
-    Get-ChildItem -Path $publishDirectory -Force | Remove-Item -Recurse -Force
+function Clear-PublishDirectory([string]$TargetDirectory) {
+    $resolvedTarget = [System.IO.Path]::GetFullPath($TargetDirectory)
+    $resolvedArtifacts = [System.IO.Path]::GetFullPath($artifactsDirectory)
+    $workspacePrefix = $repositoryRoot.TrimEnd('\') + '\'
+    if (-not $resolvedTarget.StartsWith($workspacePrefix, [StringComparison]::OrdinalIgnoreCase) -or
+        [System.IO.Path]::GetDirectoryName($resolvedTarget) -ne $resolvedArtifacts -or
+        [System.IO.Path]::GetFileName($resolvedTarget) -notin @('publish', 'publish-stub')) {
+        throw "La carpeta de publicación no está dentro del directorio artifacts esperado: $resolvedTarget"
+    }
+    foreach ($directory in @($resolvedArtifacts, $resolvedTarget)) {
+        if ((Test-Path -LiteralPath $directory) -and (Get-Item -LiteralPath $directory).LinkType) {
+            throw "No se vaciará una carpeta de publicación redirigida mediante un enlace: $directory"
+        }
+    }
+    if (Test-Path -LiteralPath $resolvedTarget) {
+        Get-ChildItem -LiteralPath $resolvedTarget -Force | ForEach-Object {
+            Remove-Item -LiteralPath $_.FullName -Recurse -Force
+        }
+    }
 }
-if (Test-Path $stubPublishDirectory) {
-    Get-ChildItem -Path $stubPublishDirectory -Force | Remove-Item -Recurse -Force
-}
+
+Clear-PublishDirectory $publishDirectory
+Clear-PublishDirectory $stubPublishDirectory
 
 New-Item -ItemType Directory -Force -Path $publishDirectory, $stubPublishDirectory, $installerDirectory | Out-Null
 

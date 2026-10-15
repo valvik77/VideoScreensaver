@@ -5,6 +5,7 @@ namespace VideoScreensaver;
 public partial class App : Application
 {
     private Window? _window;
+    private System.Threading.Timer? _cacheMaintenance;
     private bool _isScreenSaverMode;
     private bool _hasShownUnhandledError;
 
@@ -43,6 +44,8 @@ public partial class App : Application
 
     protected override void OnLaunched(LaunchActivatedEventArgs args)
     {
+        _cacheMaintenance = new System.Threading.Timer(_ => VideoCacheService.MaintainCache(),
+            null, TimeSpan.Zero, TimeSpan.FromHours(1));
         var mode = ScreenSaverMode.Parse(Environment.GetCommandLineArgs().Skip(1));
         _isScreenSaverMode = mode.Kind is ScreenSaverModeKind.Run or ScreenSaverModeKind.Preview;
         _window = mode.Kind is ScreenSaverModeKind.Run or ScreenSaverModeKind.Preview

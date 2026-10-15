@@ -94,6 +94,52 @@ public class SettingsServiceTests
             loaded.Playlist[1].VideoUri);
     }
 
+    [TestMethod]
+    public void Load_FiltersNullPlaylistItemsAndClampsInvalidValues()
+    {
+        using var workspace = new TemporaryWorkspace();
+        var path = Path.Combine(workspace.Path, "settings.json");
+        File.WriteAllText(path, """
+            { "FadeSeconds": -50, "CacheLimitMb": -1, "MaxDownloadMb": 999999,
+              "Playlist": [null, {"VideoUri": ""}, {"VideoUri": "C:\\clip.mp4"}] }
+            """);
+        var settings = SettingsService.Load(path);
+        Assert.AreEqual(0.5, settings.FadeSeconds);
+        Assert.AreEqual(64, settings.CacheLimitMb);
+        Assert.AreEqual(64, settings.MaxDownloadMb);
+        Assert.AreEqual(1, settings.Playlist.Count);
+    }
+
+    [TestMethod]
+    public void Save_WhenReplacementFailsPreservesOriginalAndRemovesTemporaryFile()
+    {
+        using var workspace = new TemporaryWorkspace();
+        var path = Path.Combine(workspace.Path, "settings.json");
+        SettingsService.Save(new AppSettings { VideoFolder = "original" }, path);
+        using (var locked = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read))
+        {
+            try
+            {
+                SettingsService.Save(new AppSettings { VideoFolder = "changed" }, path);
+                Assert.Fail("Replacing a locked configuration should fail.");
+            }
+            catch (Exception exception) when (exception is IOException or UnauthorizedAccessException) { }
+        }
+        Assert.AreEqual("original", SettingsService.Load(path).VideoFolder);
+        Assert.AreEqual(0, Directory.GetFiles(workspace.Path, "*.tmp").Length);
+    }
+
+    [TestMethod]
+    public void CacheLimitsSurviveSaving()
+    {
+        using var workspace = new TemporaryWorkspace();
+        var path = Path.Combine(workspace.Path, "settings.json");
+        SettingsService.Save(new AppSettings { CacheLimitMb = 1024, MaxDownloadMb = 128 }, path);
+        var settings = SettingsService.Load(path);
+        Assert.AreEqual(1024, settings.CacheLimitMb);
+        Assert.AreEqual(128, settings.MaxDownloadMb);
+    }
+
     private sealed class TemporaryWorkspace : IDisposable
     {
         public string Path { get; } = System.IO.Path.Combine(

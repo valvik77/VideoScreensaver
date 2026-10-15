@@ -151,6 +151,8 @@ public sealed class PixabayService
 
             response = await HttpClient.GetAsync(url, cancellationToken);
             _lastRequestUtc = DateTime.UtcNow;
+            if (response.StatusCode == System.Net.HttpStatusCode.TooManyRequests)
+                _rateLimitedUntilUtc = DateTime.UtcNow + (GetRetryAfter(response) ?? TimeSpan.FromSeconds(60));
         }
         finally
         {
@@ -301,7 +303,7 @@ public sealed class PixabayService
         {
             Directory.CreateDirectory(SearchCacheDirectory);
             var cacheFile = Path.Combine(SearchCacheDirectory, $"{cacheKey}.json");
-            var temporaryFile = $"{cacheFile}.tmp";
+            var temporaryFile = $"{cacheFile}.{Guid.NewGuid():N}.tmp";
             File.WriteAllText(temporaryFile, JsonSerializer.Serialize(result, JsonOptions));
             File.Move(temporaryFile, cacheFile, overwrite: true);
         }

@@ -4,186 +4,165 @@ using System.Text;
 
 namespace VideoScreensaver;
 
-/// <summary>
-/// Downloads remote videos (currently only Pixabay clips) to a local disk cache before playback,
-/// instead of letting MediaPlayer stream them directly over HTTP. Direct streaming was found to
-/// stall/rebuffer right near the end of the clip - visible as the screensaver freezing on the
-/// last frame during a crossfade - which never happened with local files. Downloading up front
-/// (as part of the existing preload-ahead-of-time flow) avoids that rebuffering entirely, at the
-/// cost of a bit of disk space and a short wait the first time a given clip is played.
-/// </summary>
+/// <summary>Stores complete local copies with bounded downloads and a disk quota.</summary>
 public static class VideoCacheService
 {
     private static readonly string CacheDirectory = Path.Combine(
-        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-        "VideoScreensaver",
-        "videocache");
-
-    private static readonly HttpClient HttpClient = new()
-    {
-        // Downloading a ~30s Pixabay clip should never legitimately take this long, but a
-        // generous timeout avoids aborting on a slow connection.
-        Timeout = TimeSpan.FromMinutes(5)
-    };
+        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "VideoScreensaver", "videocache");
+    private static readonly HttpClient Client = new() { Timeout = TimeSpan.FromSeconds(30) };
+    private static readonly SemaphoreSlim Gate = new(1, 1);
+    private static readonly HashSet<string> Extensions = new(StringComparer.OrdinalIgnoreCase)
+        { ".mp4", ".mov", ".m4v", ".wmv", ".avi", ".webm", ".mkv" };
 
     public static bool IsRemote(string target) =>
         Uri.TryCreate(target, UriKind.Absolute, out var uri) &&
         (uri.Scheme == Uri.UriSchemeHttp || uri.Scheme == Uri.UriSchemeHttps);
 
-    /// <summary>
-    /// Returns the local path of a cached copy of <paramref name="url"/>, downloading it first if
-    /// it isn't already cached.
-    /// </summary>
-    public static async Task<string> GetOrDownloadAsync(
-        string url,
-        CancellationToken cancellationToken,
+    public static Task<string> GetOrDownloadAsync(string url, CancellationToken cancellationToken,
         string? cacheDirectory = null)
     {
-        var targetDirectory = cacheDirectory ?? CacheDirectory;
-        Directory.CreateDirectory(targetDirectory);
-        PurgeIncompleteDownloads(TimeSpan.FromDays(1), targetDirectory);
+        var settings = SettingsService.Load();
+        return DownloadAsync(url, cancellationToken, cacheDirectory ?? CacheDirectory,
+            settings.CacheLimitMb * 1024L * 1024, settings.MaxDownloadMb * 1024L * 1024, Client);
+    }
 
-        var extension = TryGetExtension(url);
-        var cachedFile = Path.Combine(targetDirectory, $"{GetStableUrlHash(url)}{extension}");
-
-        if (File.Exists(cachedFile) && new FileInfo(cachedFile).Length > 0)
-        {
-            return cachedFile;
-        }
-
-        // Download to a temp file first so a half-finished download (e.g. app closed mid-way)
-        // never looks like a valid, complete cache entry to a later run.
-        var tempFile = Path.Combine(
-            targetDirectory,
-            $"{GetStableUrlHash(url)}.{Guid.NewGuid():N}.download");
+    internal static async Task<string> DownloadAsync(string url, CancellationToken cancellationToken,
+        string directory, long quotaBytes, long maxDownloadBytes, HttpClient client)
+    {
+        if (!IsRemote(url)) throw new ArgumentException("Se requiere una dirección HTTP o HTTPS.", nameof(url));
+        if (quotaBytes <= 0 || maxDownloadBytes <= 0 || maxDownloadBytes > quotaBytes)
+            throw new ArgumentOutOfRangeException(nameof(maxDownloadBytes));
+        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        timeout.CancelAfter(TimeSpan.FromMinutes(5));
+        var token = timeout.Token;
+        await Gate.WaitAsync(token).ConfigureAwait(false);
         try
         {
-            using (var response = await HttpClient.GetAsync(url, HttpCompletionOption.ResponseHeadersRead, cancellationToken))
+            Directory.CreateDirectory(directory);
+            // Also coordinate configuration, preview and /s processes using the same cache.
+            using var lease = await AcquireLeaseAsync(directory, token).ConfigureAwait(false);
+            PurgeIncompleteDownloads(TimeSpan.FromDays(1), directory);
+            var extension = Path.GetExtension(new Uri(url).AbsolutePath);
+            if (!Extensions.Contains(extension)) extension = ".mp4";
+            var hash = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(url)))[..32];
+            var cachedFile = Path.Combine(directory, $"{hash}{extension}");
+            if (File.Exists(cachedFile) && new FileInfo(cachedFile).Length > 0)
             {
-                response.EnsureSuccessStatusCode();
-                using var responseStream = await response.Content.ReadAsStreamAsync(cancellationToken);
-                using var fileStream = new FileStream(tempFile, FileMode.CreateNew, FileAccess.Write, FileShare.None);
-                await responseStream.CopyToAsync(fileStream, cancellationToken);
+                // Explicit timestamps are reliable even when NTFS last-access updates are off.
+                File.SetLastWriteTimeUtc(cachedFile, DateTime.UtcNow);
+                TrimCache(directory, quotaBytes, TimeSpan.FromDays(7), cachedFile);
+                return cachedFile;
             }
+            var temporaryFile = Path.Combine(directory, $"{hash}.{Guid.NewGuid():N}.download");
+            try
+            {
+                using var response = await client.GetAsync(url, HttpCompletionOption.ResponseHeadersRead, token).ConfigureAwait(false);
+                response.EnsureSuccessStatusCode();
+                var declaredSize = response.Content.Headers.ContentLength;
+                if (declaredSize == 0) throw new IOException("La descarga del vídeo está vacía.");
+                if (declaredSize > maxDownloadBytes)
+                    throw new IOException("El vídeo supera el tamaño máximo de descarga configurado.");
+                var reservedBytes = declaredSize is > 0 ? declaredSize.Value : maxDownloadBytes;
+                TrimCache(directory, quotaBytes - reservedBytes, TimeSpan.FromDays(7));
+                using var input = await response.Content.ReadAsStreamAsync(token).ConfigureAwait(false);
+                long downloaded = 0;
+                using (var output = new FileStream(temporaryFile, FileMode.CreateNew, FileAccess.Write,
+                    FileShare.None, 81920, useAsync: true))
+                {
+                    var buffer = new byte[81920];
+                    int read;
+                    while ((read = await input.ReadAsync(buffer, token).ConfigureAwait(false)) != 0)
+                    {
+                        downloaded += read;
+                        if (downloaded > maxDownloadBytes)
+                            throw new IOException("El vídeo supera el tamaño máximo de descarga configurado.");
+                        await output.WriteAsync(buffer.AsMemory(0, read), token).ConfigureAwait(false);
+                    }
+                }
+                if (downloaded == 0 || (declaredSize.HasValue && downloaded != declaredSize.Value))
+                    throw new IOException("La descarga del vídeo está vacía o incompleta.");
+                // A server may send more than Content-Length; account for actual bytes too.
+                TrimCache(directory, quotaBytes - downloaded, TimeSpan.FromDays(7));
+                token.ThrowIfCancellationRequested();
+                File.Move(temporaryFile, cachedFile, overwrite: true);
+                return cachedFile;
+            }
+            finally { TryDelete(temporaryFile); }
+        }
+        finally { Gate.Release(); }
+    }
 
-            // Move within the same directory is atomic. A concurrent request can only replace
-            // this file with its own complete download, never with a partial one.
-            File.Move(tempFile, cachedFile, overwrite: true);
-            return cachedFile;
-        }
-        finally
+    private static async Task<FileStream> AcquireLeaseAsync(string directory, CancellationToken token)
+    {
+        while (true)
         {
-            TryDeleteTemporaryFile(tempFile);
+            token.ThrowIfCancellationRequested();
+            try { return new FileStream(Path.Combine(directory, ".cache.lock"), FileMode.OpenOrCreate,
+                FileAccess.ReadWrite, FileShare.None); }
+            catch (IOException exception) when ((exception.HResult & 0xffff) is 32 or 33)
+            { await Task.Delay(100, token).ConfigureAwait(false); }
         }
+    }
+
+    public static void MaintainCache()
+    {
+        try
+        {
+            var settings = SettingsService.Load();
+            if (!Directory.Exists(CacheDirectory) || !Gate.Wait(0)) return;
+            try
+            {
+                // Do not wait for a download during periodic maintenance.
+                using var lease = new FileStream(Path.Combine(CacheDirectory, ".cache.lock"),
+                    FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None);
+                PurgeIncompleteDownloads(TimeSpan.FromDays(1));
+                TrimCache(CacheDirectory, settings.CacheLimitMb * 1024L * 1024, TimeSpan.FromDays(7));
+            }
+            finally { Gate.Release(); }
+        }
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
+        { AppDiagnostics.LogUnhandledException(exception, "Cache maintenance"); }
+    }
+
+    internal static void TrimCache(string directory, long quotaBytes, TimeSpan maxAge, string? preserve = null)
+    {
+        if (!Directory.Exists(directory)) return;
+        var files = Directory.EnumerateFiles(directory).Where(path => Extensions.Contains(Path.GetExtension(path)))
+            .Select(path => new FileInfo(path)).OrderBy(file => file.LastWriteTimeUtc).ToList();
+        var total = files.Sum(file => file.Length);
+        var cutoff = DateTime.UtcNow - maxAge;
+        foreach (var file in files)
+        {
+            if (string.Equals(file.FullName, preserve, StringComparison.OrdinalIgnoreCase)) continue;
+            if (file.LastWriteTimeUtc >= cutoff && total <= quotaBytes) continue;
+            var length = file.Length;
+            if (TryDelete(file.FullName)) total -= length;
+        }
+        if (total > quotaBytes)
+            throw new IOException("La caché no tiene espacio disponible: hay vídeos en uso o no se pueden eliminar.");
     }
 
     public static void PurgeIncompleteDownloads(TimeSpan maxAge, string? cacheDirectory = null)
     {
-        var targetDirectory = cacheDirectory ?? CacheDirectory;
-        if (!Directory.Exists(targetDirectory)) return;
-
         try
         {
-            var cutoff = DateTime.UtcNow - maxAge;
-            foreach (var partialFile in Directory.EnumerateFiles(targetDirectory, "*.download"))
-            {
-                try
-                {
-                    if (File.GetLastWriteTimeUtc(partialFile) < cutoff)
-                    {
-                        File.Delete(partialFile);
-                    }
-                }
-                catch
-                {
-                    // A download still in progress may be locked; leave it for the next cleanup.
-                }
-            }
+            var directory = cacheDirectory ?? CacheDirectory;
+            if (!Directory.Exists(directory)) return;
+            foreach (var partial in Directory.EnumerateFiles(directory, "*.download"))
+                if (File.GetLastWriteTimeUtc(partial) < DateTime.UtcNow - maxAge) TryDelete(partial);
         }
-        catch
-        {
-            // Cache cleanup is best effort only.
-        }
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException) { }
     }
 
-    private static void TryDeleteTemporaryFile(string temporaryFile)
-    {
-        try
-        {
-            if (File.Exists(temporaryFile))
-            {
-                File.Delete(temporaryFile);
-            }
-        }
-        catch
-        {
-            // A cleanup failure must not mask a download/cancellation error. The periodic
-            // incomplete-download purge will make another best-effort attempt later.
-        }
-    }
-
-    /// <summary>
-    /// Deletes cached video files that haven't been played in a while, so the cache doesn't grow
-    /// forever as new Pixabay clips are watched. Safe to call repeatedly; failures for individual
-    /// files (e.g. still open/locked because it's mid-download or mid-playback) are ignored.
-    /// </summary>
     public static void PurgeOldEntries(TimeSpan maxAge)
     {
-        if (!Directory.Exists(CacheDirectory))
-        {
-            return;
-        }
-
-        try
-        {
-            var cutoff = DateTime.UtcNow - maxAge;
-            foreach (var file in Directory.EnumerateFiles(CacheDirectory))
-            {
-                try
-                {
-                    // LastAccessTime is refreshed every time MediaPlayer opens the cached file, so
-                    // this purges clips that genuinely haven't been watched recently rather than
-                    // ones that just happen to be old.
-                    if (File.GetLastAccessTimeUtc(file) < cutoff)
-                    {
-                        File.Delete(file);
-                    }
-                }
-                catch
-                {
-                    // File may be locked or already removed; skip and continue purging the rest.
-                }
-            }
-        }
-        catch
-        {
-            // Best-effort cleanup; ignore directory enumeration failures (e.g. permissions).
-        }
+        try { TrimCache(CacheDirectory, long.MaxValue, maxAge); }
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException) { }
     }
 
-    private static string TryGetExtension(string url)
+    private static bool TryDelete(string path)
     {
-        try
-        {
-            var path = new Uri(url).AbsolutePath;
-            var extension = Path.GetExtension(path);
-            return string.IsNullOrEmpty(extension) ? ".mp4" : extension;
-        }
-        catch
-        {
-            return ".mp4";
-        }
-    }
-
-    /// <summary>
-    /// Computes a hash of the URL that is stable across process runs, so the same Pixabay clip
-    /// always maps to the same cache file instead of downloading a fresh copy on every run (see
-    /// VideoLibrary.GetStablePathHash for the same reasoning applied to thumbnails).
-    /// </summary>
-    private static string GetStableUrlHash(string url)
-    {
-        var bytes = Encoding.UTF8.GetBytes(url);
-        var hash = SHA256.HashData(bytes);
-        return Convert.ToHexString(hash)[..16];
+        try { File.Delete(path); return true; }
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException) { return false; }
     }
 }
